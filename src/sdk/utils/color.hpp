@@ -5,9 +5,7 @@ namespace sdk
 	class Color
 	{
 	public:
-		Color() {
-			*((int*)this) = 0;
-		}
+		Color() = default;
 
 		Color(int _r, int _g, int _b) {
 			SetColor(_r, _g, _b, 0);
@@ -74,6 +72,6 @@ namespace sdk
 		static Color Purple() { return Color(220, 0, 220); }
 
 	private:
-		unsigned char _color[4];
+		unsigned char _color[4] = {};
 	};
 }

@@ -1,44 +1,60 @@
 #pragma once
+#include <atomic>
+#include <memory>
+#include <vector>
 
-namespace components::loader
+namespace components
 {
-	class component_module
+	class component
 	{
 	public:
-
+		component() {}
+		virtual ~component() {}
 	};
 
-	class module_loader final
+	class loader
 	{
 	public:
-		template <typename T>
-		class installer final
+		static void initialize();
+		static void uninitialize();
+
+		static utils::memory::allocator* get_allocator();
+
+		// Direct detours are installed by several component constructors before the
+		// complete compatibility graph exists. Keep every top-level runtime callback
+		// dormant until all components have been constructed.
+		static bool is_runtime_ready() noexcept
 		{
-			static_assert(std::is_base_of<component_module, T>::value, "Module has invalid base class");
-
-		public:
-			installer() {
-				register_module(std::make_unique<T>());
-			}
-		};
-
-		template <typename T>
-		static T* get()
-		{
-			for (const auto& module_ : *modules_)
-			{
-				if (typeid(*module_.get()) == typeid(T)) {
-					return reinterpret_cast<T*>(module_.get());
-				}
-			}
-
-			return nullptr;
+			return runtime_ready_.load(std::memory_order_acquire);
 		}
 
-		static void register_module(std::unique_ptr<component_module>&& component_module);
-
 	private:
-		static std::vector<std::unique_ptr<component_module>>* modules_;
-		static void destroy_modules();
+		static std::vector<std::unique_ptr<component>> components_;
+		static utils::memory::allocator mem_allocator_;
+		static inline std::atomic<bool> runtime_ready_ = false;
+
+		template<class ComponentType>
+		static void register_component()
+		{
+			components_.emplace_back(std::make_unique<ComponentType>());
+		}
+
 	};
 }
+
+#include "modules/interfaces.hpp"
+#include "modules/flags.hpp"
+#include "modules/game_settings.hpp"
+#include "modules/remix_api.hpp"
+#include "modules/choreo_events.hpp"
+#include "modules/sound_events.hpp"
+#include "modules/remix_lights.hpp"
+#include "modules/dynamic_lighting.hpp"
+#include "modules/remix_vars.hpp"
+#include "modules/remix_markers.hpp"
+#include "modules/main_module.hpp"
+#include "modules/static_scene_cache.hpp"
+#include "modules/model_render.hpp"
+#include "modules/material_exporter.hpp"
+#include "modules/map_settings.hpp"
+#include "modules/imgui.hpp"

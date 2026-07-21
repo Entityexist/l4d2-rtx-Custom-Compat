@@ -1,7 +1,5 @@
 #include <std_include.hpp>
 
-#include "components/modules/interfaces.hpp"
-
 namespace sdk
 {
 	netvar_manager g_netvars;

@@ -1,0 +1,59 @@
+# Copy individual blocks to:
+# l4d2-rtx/map_lights/<map-name>.toml
+version = 5
+
+# Disable one incorrect compiled record.
+[[light]]
+source_index = 412
+enabled = false
+
+# Correct a spotlight using a stable Hammer ID when available.
+[[light]]
+hammer_id = 83527
+position_offset = [0.0, 0.0, 5.0]
+intensity_scale = 0.80
+radius_scale = 1.15
+direction = [0.0, 1.0, -0.15]
+degrees = 62.0
+softness = 0.25
+
+# Force a compiled light to follow a specific destructible/movable prop.
+[[light]]
+targetname = "hallway_light_04"
+owner_targetname = "hallway_lamp_prop_04"
+surface_offset = 2.5
+
+# Broaden an emit_surface approximation.
+[[light]]
+source_index = 928
+surface_cluster = true
+surface_samples = 6
+surface_pattern = "line"
+surface_spread = 0.80
+surface_aspect = 2.5
+surface_intensity = 0.28
+surface_radius_scale = 0.42
+
+# Add a persistent rotating/sweeping animation to an imported spotlight.
+[[light]]
+targetname = "parking_searchlight"
+classname = "env_projectedtexture"
+animation = "searchlight_sweep"
+animation_duration = 2.2
+animation_speed = 1.0
+animation_variation = 0.10
+animation_axis = [0.0, 0.0, 1.0]
+animation_degrees = 110.0
+animation_phase = 0.0
+
+# Provenance written by V16. These fields are informational and do not act as selectors.
+[[light]]
+runtime_entity_index = 561
+runtime_kind = "projected_texture"
+classname = "env_projectedtexture"
+source_kind = "projected_texture"
+source_style = 7
+source_owner = 142
+source_key = 561
+source_live_link = true
+position_offset = [0.0, 0.0, 2.0]

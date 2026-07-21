@@ -22,6 +22,27 @@ namespace sdk
 		using original_fn = Vector & (__thiscall*)(c_base_entity*);
 		return (*(original_fn * *)this)[10](this);
 	}
+
+	Vector c_base_entity::get_absolute_angles()
+	{
+		if (!this) {
+			return Vector(0, 0, 0);
+		}
+
+		using original_fn = Vector & (__thiscall*)(c_base_entity*);
+		return (*(original_fn * *)this)[11](this);
+	}
+
+	std::uint32_t c_base_entity::get_ref_handle_raw()
+	{
+		if (!this) {
+			return 0xffffffffu;
+		}
+
+		using original_fn = const components::CBaseHandle* (__thiscall*)(c_base_entity*);
+		const auto* handle = (*(original_fn**)this)[2](this);
+		return handle ? handle->m_Index : 0xffffffffu;
+	}
 	
 	c_client_class* c_base_entity::client_class()
 	{

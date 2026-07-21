@@ -26,6 +26,7 @@ namespace sdk
 		int get_player_for_user_id(int user_id);
 		int get_max_clients();
 		const char* get_level_name();
+		float light_style_value(int style);
 		bool is_console_visible();
 		components::VMatrix& world_to_screen_matrix();
 		bool get_player_info(int id, player_info_t* info);

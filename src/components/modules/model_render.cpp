@@ -1,15 +1,72 @@
 #include "std_include.hpp"
-#include "model_render.hpp"
-
-#include "game_settings.hpp"
-#include "imgui.hpp"
-#include "main_module.hpp"
-#include "map_settings.hpp"
-#include "remix_lights.hpp"
-#include "remix_markers.hpp"
 
 namespace components
 {
+	namespace
+	{
+		thread_local bool g_compat_primitive_active = false;
+
+		bool compat_gameplay_render_active()
+		{
+			const auto* intf = interfaces::get();
+			return loader::is_runtime_ready() && intf && intf->m_engine && intf->m_engine->is_playing();
+		}
+
+
+		bool source_material_special_pass(IDirect3DDevice9* device, const prim_fvf_context& ctx)
+		{
+			const auto& material_name = ctx.info.material_name;
+			const auto& shader_name = ctx.info.shader_name;
+			auto* material = ctx.info.material;
+
+			const bool named_helper =
+				material_name.starts_with("dev/glow_") ||
+				material_name == "dev/halo_add_to_screen" ||
+				material_name.starts_with("dev/wireframe") ||
+				material_name.starts_with("dev/lumc") ||
+				material_name.starts_with("engine/occl") ||
+				material_name.starts_with("sprites/light_glow") ||
+				material_name == "decals/simpleshadow";
+
+			const bool shader_helper =
+				shader_name.starts_with("Engine_") ||
+				shader_name.starts_with("Shadow") ||
+				shader_name.starts_with("DepthWrite") ||
+				shader_name.starts_with("Wireframe") ||
+				shader_name.starts_with("Debug");
+
+			bool flagged_helper = false;
+			if (material && material->vftable && material->vftable->GetMaterialVarFlag)
+			{
+				flagged_helper =
+					material->vftable->GetMaterialVarFlag(material, nullptr, MATERIAL_VAR_DEBUG) ||
+					material->vftable->GetMaterialVarFlag(material, nullptr, MATERIAL_VAR_NO_DRAW) ||
+					material->vftable->GetMaterialVarFlag(material, nullptr, MATERIAL_VAR_IGNOREZ) ||
+					material->vftable->GetMaterialVarFlag(material, nullptr, MATERIAL_VAR_WIREFRAME);
+
+				if (!flagged_helper &&
+					(material_name.starts_with("dev/") || material_name.starts_with("vgui/") ||
+					 material_name.starts_with("sprites/")))
+				{
+					flagged_helper = material->vftable->GetMaterialVarFlag(
+						material, nullptr, MATERIAL_VAR_ADDITIVE);
+				}
+			}
+
+			DWORD color_write = 0x0fu;
+			const bool depth_only = device &&
+				SUCCEEDED(device->GetRenderState(D3DRS_COLORWRITEENABLE, &color_write)) &&
+				(color_write & 0x0fu) == 0u;
+
+			return named_helper || shader_helper || flagged_helper || depth_only;
+		}
+
+		bool suppress_source_interaction_helper(const prim_fvf_context& ctx)
+		{
+			return ctx.info.material_name.starts_with("dev/glow_") ||
+				ctx.info.material_name == "dev/halo_add_to_screen";
+		}
+	}
 	namespace cmd
 	{
 		bool model_info_vis = false;
@@ -20,11 +77,10 @@ namespace components
 
 	namespace tex_addons
 	{
-		LPDIRECT3DTEXTURE9 glass_shards = nullptr;
-		LPDIRECT3DTEXTURE9 rain_drop = nullptr;
-		LPDIRECT3DTEXTURE9 black = nullptr;
-		LPDIRECT3DTEXTURE9 white = nullptr;
-		LPDIRECT3DTEXTURE9 berry = nullptr;
+		LPDIRECT3DTEXTURE9 glass_shards;
+		LPDIRECT3DTEXTURE9 rain_drop;
+		LPDIRECT3DTEXTURE9 black;
+		LPDIRECT3DTEXTURE9 white;
 	}
 
 	std::vector<Vector> g_sunoverlay_color = {};
@@ -37,23 +93,14 @@ namespace components
 			if (tex_addons::rain_drop) tex_addons::rain_drop->Release();
 			if (tex_addons::black) tex_addons::black->Release();
 			if (tex_addons::white) tex_addons::white->Release();
-			if (tex_addons::berry) tex_addons::berry->Release();
 			return;
 		}
 
-		auto load_texture = [](IDirect3DDevice9* dev, const char* path, LPDIRECT3DTEXTURE9* tex)
-			{
-				HRESULT hr;
-				hr = D3DXCreateTextureFromFileA(dev, path, tex);
-				if (FAILED(hr)) utils::log("ModelRender", std::format("Failed to load {}", path), utils::LOG_TYPE::LOG_TYPE_ERROR, true);
-			};
-
 		const auto dev = game::get_d3d_device();
-		load_texture(dev, COMPMOD_ASSET_DIR "textures\\glass_shards.png", &tex_addons::glass_shards);
-		load_texture(dev, COMPMOD_ASSET_DIR "textures\\raindrop.png", &tex_addons::rain_drop);
-		load_texture(dev, COMPMOD_ASSET_DIR "textures\\black.dds", &tex_addons::black);
-		load_texture(dev, COMPMOD_ASSET_DIR "textures\\white.dds", &tex_addons::white);
-		load_texture(dev, COMPMOD_ASSET_DIR "textures\\berry.png", &tex_addons::berry);
+		D3DXCreateTextureFromFileA(dev, COMPMOD_ASSET_DIR "textures\\glass_shards.png", &tex_addons::glass_shards);
+		D3DXCreateTextureFromFileA(dev, COMPMOD_ASSET_DIR "textures\\raindrop.png", &tex_addons::rain_drop);
+		D3DXCreateTextureFromFileA(dev, COMPMOD_ASSET_DIR "textures\\black.dds", &tex_addons::black);
+		D3DXCreateTextureFromFileA(dev, COMPMOD_ASSET_DIR "textures\\white.dds", &tex_addons::white);
 	}
 
 	// check for specific material var and return it in 'out_var'
@@ -67,6 +114,734 @@ namespace components
 		}
 
 		return found;
+	}
+
+	namespace studio_model_ffp_bridge
+	{
+		std::uint64_t converted_draws = 0u;
+		std::uint64_t missing_albedo = 0u;
+
+		void apply(IDirect3DDevice9* dev, IShaderAPIDX8* shaderapi, prim_fvf_context& ctx, const DWORD fvf,
+            const int albedo_sampler = 0)
+		{
+			ctx.save_vs(dev);
+			ctx.save_ps(dev);
+			dev->SetVertexShader(nullptr);
+			dev->SetPixelShader(nullptr);
+			dev->SetFVF(fvf);
+
+			const auto sampler = std::clamp(albedo_sampler, 0, 15);
+			if (shaderapi && ctx.info.buffer_state.m_BoundTexture[sampler] > 0)
+			{
+				if (auto* albedo = shaderapi->vtbl->GetD3DTexture(
+					shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[sampler]); albedo)
+				{
+					ctx.save_texture(dev, 0u);
+					dev->SetTexture(0u, albedo);
+				}
+				else ++missing_albedo;
+			}
+			else ++missing_albedo;
+
+			ctx.save_rs(dev, D3DRS_LIGHTING);
+			ctx.save_rs(dev, D3DRS_SPECULARENABLE);
+			dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+			dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+
+			ctx.save_tss(dev, 0u, D3DTSS_COLOROP);
+			ctx.save_tss(dev, 0u, D3DTSS_COLORARG1);
+			ctx.save_tss(dev, 0u, D3DTSS_ALPHAOP);
+			ctx.save_tss(dev, 0u, D3DTSS_ALPHAARG1);
+			ctx.save_tss(dev, 0u, D3DTSS_TEXCOORDINDEX);
+			ctx.save_tss(dev, 0u, D3DTSS_TEXTURETRANSFORMFLAGS);
+			dev->SetTextureStageState(0u, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0u, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0u, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0u, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0u, D3DTSS_TEXCOORDINDEX, 0u);
+			dev->SetTextureStageState(0u, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+
+			// End only the fixed-function combiner. The original normal/detail textures
+			// remain bound on their Source samplers for the ABI-v2 runtime consumer.
+			ctx.save_tss(dev, 1u, D3DTSS_COLOROP);
+			ctx.save_tss(dev, 1u, D3DTSS_ALPHAOP);
+			dev->SetTextureStageState(1u, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			dev->SetTextureStageState(1u, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+			++converted_draws;
+		}
+	}
+
+	namespace world_ffp_bridge
+	{
+		bool g_enabled = true;
+		std::uint64_t g_converted_draws = 0u;
+		std::uint64_t g_passthrough_draws = 0u;
+		std::uint64_t g_failed_pass_captures = 0u;
+
+		// Convert Source world geometry into an explicit fixed-function pass.
+		// The critical part is removing BOTH programmable shaders. DXVK Remix then
+		// enters its fixed-function material path and identifies stage 0 as the
+		// replaceable albedo instead of treating every shader sampler as material data.
+		void apply(IDirect3DDevice9* dev, IShaderAPIDX8* shaderapi, prim_fvf_context& ctx, const DWORD fvf)
+		{
+			ctx.save_vs(dev);
+			ctx.save_ps(dev);
+			dev->SetVertexShader(nullptr);
+			dev->SetPixelShader(nullptr);
+			dev->SetFVF(fvf);
+
+			dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
+			dev->SetTransform(D3DTS_VIEW, &ctx.info.buffer_state.m_Transform[1]);
+			dev->SetTransform(D3DTS_PROJECTION, &ctx.info.buffer_state.m_Transform[2]);
+
+			// Bind the actual Source basetexture explicitly. Shader samplers often leave
+			// lightmaps, masks or unrelated textures in D3D stages that are not valid
+			// fixed-function material channels.
+			if (shaderapi && ctx.info.buffer_state.m_BoundTexture[0])
+			{
+				if (const auto base_texture = shaderapi->vtbl->GetD3DTexture(
+					shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[0]); base_texture)
+				{
+					ctx.save_texture(dev, 0u);
+					dev->SetTexture(0u, base_texture);
+				}
+			}
+
+			ctx.save_rs(dev, D3DRS_LIGHTING);
+			ctx.save_rs(dev, D3DRS_SPECULARENABLE);
+			ctx.save_rs(dev, D3DRS_COLORVERTEX);
+			dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+			dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+			dev->SetRenderState(D3DRS_COLORVERTEX, FALSE);
+
+			ctx.save_tss(dev, 0u, D3DTSS_COLOROP);
+			ctx.save_tss(dev, 0u, D3DTSS_COLORARG1);
+			ctx.save_tss(dev, 0u, D3DTSS_COLORARG2);
+			ctx.save_tss(dev, 0u, D3DTSS_ALPHAOP);
+			ctx.save_tss(dev, 0u, D3DTSS_ALPHAARG1);
+			ctx.save_tss(dev, 0u, D3DTSS_ALPHAARG2);
+			ctx.save_tss(dev, 0u, D3DTSS_TEXCOORDINDEX);
+			ctx.save_tss(dev, 0u, D3DTSS_TEXTURETRANSFORMFLAGS);
+			ctx.save_tss(dev, 0u, D3DTSS_RESULTARG);
+
+			dev->SetTextureStageState(0u, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0u, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0u, D3DTSS_COLORARG2, D3DTA_CURRENT);
+			dev->SetTextureStageState(0u, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			dev->SetTextureStageState(0u, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+			dev->SetTextureStageState(0u, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+			dev->SetTextureStageState(0u, D3DTSS_TEXCOORDINDEX, 0u);
+			dev->SetTextureStageState(0u, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+			dev->SetTextureStageState(0u, D3DTSS_RESULTARG, D3DTA_CURRENT);
+
+			// A fixed-function chain terminates on the first disabled color stage.
+			// Disable stage 1 so Source lightmaps and shader-only masks cannot become
+			// accidental replacement textures or unstable material identities.
+			ctx.save_tss(dev, 1u, D3DTSS_COLOROP);
+			ctx.save_tss(dev, 1u, D3DTSS_ALPHAOP);
+			dev->SetTextureStageState(1u, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			dev->SetTextureStageState(1u, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+			++g_converted_draws;
+		}
+
+		void print_status()
+		{
+			game::console();
+			printf(
+				"[World FFP] enabled=%d converted=%llu passthrough=%llu failed_pass_capture=%llu stable_source_hashes=%d "
+				"studio_converted=%llu studio_missing_albedo=%llu\n",
+				g_enabled ? 1 : 0,
+				static_cast<unsigned long long>(g_converted_draws),
+				static_cast<unsigned long long>(g_passthrough_draws),
+				static_cast<unsigned long long>(g_failed_pass_captures),
+				material_exporter::m_inject_stable_hashes ? 1 : 0,
+				static_cast<unsigned long long>(studio_model_ffp_bridge::converted_draws),
+				static_cast<unsigned long long>(studio_model_ffp_bridge::missing_albedo));
+		}
+	}
+
+
+	namespace wound_capture
+	{
+		constexpr std::uint32_t k_source_texture_count = 16u;
+		constexpr std::uint32_t k_device_texture_count = 16u;
+		constexpr std::uint32_t k_max_unique_captures = 512u;
+		constexpr ULONGLONG k_continuous_capture_interval_ms = 250u;
+
+		struct constant_snapshot_s
+		{
+			std::vector<float> vs_float;
+			std::vector<float> ps_float;
+			std::vector<int> vs_int;
+			std::vector<int> ps_int;
+			std::vector<BOOL> vs_bool;
+			std::vector<BOOL> ps_bool;
+			std::uint32_t vs_float_count = 0u;
+			std::uint32_t ps_float_count = 0u;
+		};
+
+		struct texture_probe_s
+		{
+			std::uintptr_t pointer = 0u;
+			D3DRESOURCETYPE type = D3DRTYPE_FORCE_DWORD;
+			UINT width = 0u;
+			UINT height = 0u;
+			UINT depth = 0u;
+			UINT levels = 0u;
+			D3DFORMAT format = D3DFMT_UNKNOWN;
+			std::uint64_t content_hash = 0u;
+			std::uint8_t alpha_min = 255u;
+			std::uint8_t alpha_max = 0u;
+			bool readback_ok = false;
+		};
+
+		struct state_s
+		{
+			bool continuous = false;
+			bool once = false;
+			std::uint32_t capture_index = 0u;
+			ULONGLONG last_continuous_tick = 0u;
+			std::unordered_set<std::uint64_t> signatures;
+		};
+
+		state_s g_state;
+
+		std::string json_escape(const std::string_view text)
+		{
+			std::string result;
+			result.reserve(text.size() + 16u);
+			for (const unsigned char c : text)
+			{
+				switch (c)
+				{
+				case '\\': result += "\\\\"; break;
+				case '"': result += "\\\""; break;
+				case '\n': result += "\\n"; break;
+				case '\r': result += "\\r"; break;
+				case '\t': result += "\\t"; break;
+				default:
+					if (c < 0x20u) {
+						result += std::format("\\u{:04x}", static_cast<unsigned int>(c));
+					} else {
+						result.push_back(static_cast<char>(c));
+					}
+					break;
+				}
+			}
+			return result;
+		}
+
+		std::string sanitize_file_name(const std::string_view text)
+		{
+			std::string result;
+			result.reserve(text.size());
+			for (const unsigned char c : text)
+			{
+				if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+					(c >= '0' && c <= '9') || c == '_' || c == '-') {
+					result.push_back(static_cast<char>(c));
+				} else {
+					result.push_back('_');
+				}
+			}
+			if (result.empty()) result = "unknown";
+			if (result.size() > 96u) result.resize(96u);
+			return result;
+		}
+
+		std::filesystem::path capture_root_path()
+		{
+			if (game::root_path.empty())
+			{
+				char path[MAX_PATH]{};
+				GetModuleFileNameA(nullptr, path, MAX_PATH);
+				game::root_path = path;
+				utils::erase_substring(game::root_path, "left4dead2.exe");
+			}
+			return std::filesystem::path(game::root_path) / "l4d2-rtx" / "logs" / "wound_capture";
+		}
+
+		std::uint64_t fnv1a64_bytes(const void* data, const std::size_t size, std::uint64_t seed = 14695981039346656037ull)
+		{
+			const auto* bytes = static_cast<const std::uint8_t*>(data);
+			std::uint64_t hash = seed;
+			for (std::size_t i = 0; i < size; ++i)
+			{
+				hash ^= bytes[i];
+				hash *= 1099511628211ull;
+			}
+			return hash;
+		}
+
+		std::uint64_t combine_hash(std::uint64_t seed, const std::uint64_t value)
+		{
+			return fnv1a64_bytes(&value, sizeof(value), seed);
+		}
+
+		bool get_shader_blob(IDirect3DVertexShader9* shader, std::vector<BYTE>& blob)
+		{
+			blob.clear();
+			if (!shader) return false;
+			UINT size = 0u;
+			if (FAILED(shader->GetFunction(nullptr, &size)) || size == 0u) return false;
+			blob.resize(size);
+			if (FAILED(shader->GetFunction(blob.data(), &size))) {
+				blob.clear();
+				return false;
+			}
+			blob.resize(size);
+			return true;
+		}
+
+		bool get_shader_blob(IDirect3DPixelShader9* shader, std::vector<BYTE>& blob)
+		{
+			blob.clear();
+			if (!shader) return false;
+			UINT size = 0u;
+			if (FAILED(shader->GetFunction(nullptr, &size)) || size == 0u) return false;
+			blob.resize(size);
+			if (FAILED(shader->GetFunction(blob.data(), &size))) {
+				blob.clear();
+				return false;
+			}
+			blob.resize(size);
+			return true;
+		}
+
+		void write_binary(const std::filesystem::path& path, const std::vector<BYTE>& data)
+		{
+			if (data.empty()) return;
+			std::ofstream file(path, std::ios::binary | std::ios::trunc);
+			if (file.is_open()) {
+				file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+			}
+		}
+
+		constant_snapshot_s capture_constants(IDirect3DDevice9* dev)
+		{
+			constant_snapshot_s result;
+			D3DCAPS9 caps{};
+			dev->GetDeviceCaps(&caps);
+
+			result.vs_float_count = std::clamp<UINT>(caps.MaxVertexShaderConst, 0u, 256u);
+			const UINT ps_major = D3DSHADER_VERSION_MAJOR(caps.PixelShaderVersion);
+			result.ps_float_count = ps_major >= 3u ? 224u : (ps_major >= 2u ? 32u : 8u);
+
+			result.vs_float.assign(static_cast<std::size_t>(result.vs_float_count) * 4u, 0.0f);
+			result.ps_float.assign(static_cast<std::size_t>(result.ps_float_count) * 4u, 0.0f);
+			for (UINT i = 0; i < result.vs_float_count; ++i) {
+				dev->GetVertexShaderConstantF(i, result.vs_float.data() + static_cast<std::size_t>(i) * 4u, 1u);
+			}
+			for (UINT i = 0; i < result.ps_float_count; ++i) {
+				dev->GetPixelShaderConstantF(i, result.ps_float.data() + static_cast<std::size_t>(i) * 4u, 1u);
+			}
+
+			result.vs_int.assign(16u * 4u, 0);
+			result.ps_int.assign(16u * 4u, 0);
+			for (UINT i = 0; i < 16u; ++i) {
+				dev->GetVertexShaderConstantI(i, result.vs_int.data() + static_cast<std::size_t>(i) * 4u, 1u);
+				dev->GetPixelShaderConstantI(i, result.ps_int.data() + static_cast<std::size_t>(i) * 4u, 1u);
+			}
+
+			result.vs_bool.assign(16u, FALSE);
+			result.ps_bool.assign(16u, FALSE);
+			for (UINT i = 0; i < 16u; ++i) {
+				dev->GetVertexShaderConstantB(i, result.vs_bool.data() + i, 1u);
+				dev->GetPixelShaderConstantB(i, result.ps_bool.data() + i, 1u);
+			}
+			return result;
+		}
+
+		void write_float_constants(const std::filesystem::path& path, const std::vector<float>& values)
+		{
+			std::ofstream file(path, std::ios::trunc);
+			if (!file.is_open()) return;
+			file << "register,x,y,z,w,raw_x,raw_y,raw_z,raw_w\n";
+			file << std::setprecision(9);
+			for (std::size_t i = 0; i + 3u < values.size(); i += 4u)
+			{
+				const auto* raw = reinterpret_cast<const std::uint32_t*>(values.data() + i);
+				file << (i / 4u) << ',' << values[i] << ',' << values[i + 1u] << ',' << values[i + 2u] << ',' << values[i + 3u]
+					<< ",0x" << std::hex << raw[0] << ",0x" << raw[1] << ",0x" << raw[2] << ",0x" << raw[3] << std::dec << '\n';
+			}
+		}
+
+		void write_int_constants(const std::filesystem::path& path, const std::vector<int>& values)
+		{
+			std::ofstream file(path, std::ios::trunc);
+			if (!file.is_open()) return;
+			file << "register,x,y,z,w\n";
+			for (std::size_t i = 0; i + 3u < values.size(); i += 4u) {
+				file << (i / 4u) << ',' << values[i] << ',' << values[i + 1u] << ',' << values[i + 2u] << ',' << values[i + 3u] << '\n';
+			}
+		}
+
+		void write_bool_constants(const std::filesystem::path& path, const std::vector<BOOL>& values)
+		{
+			std::ofstream file(path, std::ios::trunc);
+			if (!file.is_open()) return;
+			file << "register,value\n";
+			for (std::size_t i = 0; i < values.size(); ++i) {
+				file << i << ',' << (values[i] ? 1 : 0) << '\n';
+			}
+		}
+
+		texture_probe_s probe_texture(IDirect3DBaseTexture9* texture, const std::filesystem::path& texture_dir)
+		{
+			texture_probe_s result;
+			if (!texture) return result;
+			result.pointer = reinterpret_cast<std::uintptr_t>(texture);
+			result.type = texture->GetType();
+			result.levels = texture->GetLevelCount();
+
+			if (result.type == D3DRTYPE_TEXTURE)
+			{
+				auto* texture2d = static_cast<IDirect3DTexture9*>(texture);
+				D3DSURFACE_DESC desc{};
+				if (FAILED(texture2d->GetLevelDesc(0u, &desc))) return result;
+				result.width = desc.Width;
+				result.height = desc.Height;
+				result.depth = 1u;
+				result.format = desc.Format;
+
+				IDirect3DDevice9* device = nullptr;
+				IDirect3DSurface9* source = nullptr;
+				IDirect3DSurface9* system = nullptr;
+				auto cleanup = [&]() {
+					if (system) system->Release();
+					if (source) source->Release();
+					if (device) device->Release();
+				};
+
+				if (FAILED(texture2d->GetDevice(&device)) || !device ||
+					FAILED(texture2d->GetSurfaceLevel(0u, &source)) || !source ||
+					FAILED(device->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
+						D3DPOOL_SYSTEMMEM, &system, nullptr)) || !system ||
+					FAILED(D3DXLoadSurfaceFromSurface(system, nullptr, nullptr, source, nullptr, nullptr, D3DX_FILTER_NONE, 0u)))
+				{
+					cleanup();
+					return result;
+				}
+
+				D3DLOCKED_RECT locked{};
+				if (FAILED(system->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+					cleanup();
+					return result;
+				}
+
+				std::uint64_t hash = 14695981039346656037ull;
+				for (UINT y = 0u; y < desc.Height; ++y)
+				{
+					const auto* row = static_cast<const std::uint8_t*>(locked.pBits) + static_cast<std::size_t>(y) * locked.Pitch;
+					hash = fnv1a64_bytes(row, static_cast<std::size_t>(desc.Width) * 4u, hash);
+					for (UINT x = 0u; x < desc.Width; ++x)
+					{
+						const auto alpha = row[static_cast<std::size_t>(x) * 4u + 3u];
+						result.alpha_min = std::min(result.alpha_min, alpha);
+						result.alpha_max = std::max(result.alpha_max, alpha);
+					}
+				}
+				system->UnlockRect();
+				result.content_hash = hash;
+				result.readback_ok = true;
+
+				std::error_code ec;
+				std::filesystem::create_directories(texture_dir, ec);
+				const auto dump_path = texture_dir / std::format("tex_{:016x}_{}x{}.tga", hash, desc.Width, desc.Height);
+				if (!std::filesystem::exists(dump_path, ec)) {
+					D3DXSaveSurfaceToFileA(dump_path.string().c_str(), D3DXIFF_TGA, system, nullptr, nullptr);
+				}
+				cleanup();
+			}
+			else if (result.type == D3DRTYPE_CUBETEXTURE)
+			{
+				D3DSURFACE_DESC desc{};
+				if (SUCCEEDED(static_cast<IDirect3DCubeTexture9*>(texture)->GetLevelDesc(0u, &desc))) {
+					result.width = desc.Width; result.height = desc.Height; result.depth = 6u; result.format = desc.Format;
+				}
+			}
+			else if (result.type == D3DRTYPE_VOLUMETEXTURE)
+			{
+				D3DVOLUME_DESC desc{};
+				if (SUCCEEDED(static_cast<IDirect3DVolumeTexture9*>(texture)->GetLevelDesc(0u, &desc))) {
+					result.width = desc.Width; result.height = desc.Height; result.depth = desc.Depth; result.format = desc.Format;
+				}
+			}
+			return result;
+		}
+
+		void write_texture_json(std::ofstream& file, const texture_probe_s& texture)
+		{
+			file << "{\"pointer\":\"0x" << std::hex << texture.pointer << std::dec
+				<< "\",\"type\":" << static_cast<unsigned int>(texture.type)
+				<< ",\"width\":" << texture.width << ",\"height\":" << texture.height
+				<< ",\"depth\":" << texture.depth << ",\"levels\":" << texture.levels
+				<< ",\"format\":" << static_cast<unsigned int>(texture.format)
+				<< ",\"content_hash\":\"0x" << std::hex << texture.content_hash << std::dec
+				<< "\",\"alpha_min\":" << static_cast<unsigned int>(texture.alpha_min)
+				<< ",\"alpha_max\":" << static_cast<unsigned int>(texture.alpha_max)
+				<< ",\"readback_ok\":" << (texture.readback_ok ? "true" : "false") << '}';
+		}
+
+		void write_material_vars(std::ofstream& file, IMaterialInternal* material)
+		{
+			static constexpr const char* names[] = {
+				"$wounded", "$woundcutouttexture", "$cutouttexturebias", "$cutoutdecalmappingscale",
+				"$debugellipsoids", "$ellipsoidcenter", "$ellipsoidup", "$ellipsoidlookat", "$ellipsoidscale",
+				"$ellipsoidcenter2", "$ellipsoidup2", "$ellipsoidlookat2", "$ellipsoidscale2", "$ellipsoid2culltype",
+				"$disablevariation", "$nocull"
+			};
+
+			file << "\"material_vars\":[";
+			bool first = true;
+			for (const char* name : names)
+			{
+				bool found = false;
+				auto* var = material ? material->vftable->FindVar(material, nullptr, name, &found, false) : nullptr;
+				if (!first) file << ',';
+				first = false;
+				file << "{\"name\":\"" << json_escape(name) << "\",\"found\":" << (found && var ? "true" : "false");
+				if (found && var)
+				{
+					// Source material variable types: float=0, string=1, vector=2,
+					// texture=3, int=4. Use only the matching accessor: asking a
+					// texture/vector variable for a scalar can trigger engine-side
+					// conversions or assertions in some shader permutations.
+					file << ",\"defined\":" << (var->vftable->IsDefined(var) ? "true" : "false")
+						<< ",\"type\":" << static_cast<unsigned int>(var->m_Type);
+
+					switch (var->m_Type)
+					{
+					case 0u:
+						file << ",\"float\":" << std::setprecision(9) << var->vftable->GetFloatValueInternal(var);
+						break;
+					case 1u:
+					{
+						const char* value = var->vftable->GetStringValue(var);
+						file << ",\"string\":\"" << json_escape(value ? value : "") << "\"";
+						break;
+					}
+					case 2u:
+					{
+						const float* vec = var->vftable->GetVecValueInternal1(var);
+						const int vector_size = std::clamp(var->vftable->VectorSizeInternal(var), 0, 4);
+						file << ",\"vector_size\":" << vector_size << ",\"vector\":[";
+						for (int component = 0; component < vector_size; ++component) {
+							if (component) file << ',';
+							file << std::setprecision(9) << (vec ? vec[component] : 0.0f);
+						}
+						file << ']';
+						break;
+					}
+					case 3u:
+					{
+						auto* texture = var->vftable->GetTextureValue(var);
+						const char* texture_name = texture && texture->vftable ? texture->vftable->GetName(texture) : "";
+						file << ",\"texture_name\":\"" << json_escape(texture_name ? texture_name : "") << "\"";
+						break;
+					}
+					case 4u:
+						file << ",\"int\":" << var->vftable->GetIntValueInternal(var);
+						break;
+					default:
+						break;
+					}
+				}
+				file << '}';
+			}
+			file << ']';
+		}
+
+		std::uint64_t constants_hash(const constant_snapshot_s& constants)
+		{
+			std::uint64_t hash = 14695981039346656037ull;
+			if (!constants.vs_float.empty()) hash = fnv1a64_bytes(constants.vs_float.data(), constants.vs_float.size() * sizeof(float), hash);
+			if (!constants.ps_float.empty()) hash = fnv1a64_bytes(constants.ps_float.data(), constants.ps_float.size() * sizeof(float), hash);
+			if (!constants.vs_int.empty()) hash = fnv1a64_bytes(constants.vs_int.data(), constants.vs_int.size() * sizeof(int), hash);
+			if (!constants.ps_int.empty()) hash = fnv1a64_bytes(constants.ps_int.data(), constants.ps_int.size() * sizeof(int), hash);
+			if (!constants.vs_bool.empty()) hash = fnv1a64_bytes(constants.vs_bool.data(), constants.vs_bool.size() * sizeof(BOOL), hash);
+			if (!constants.ps_bool.empty()) hash = fnv1a64_bytes(constants.ps_bool.data(), constants.ps_bool.size() * sizeof(BOOL), hash);
+			return hash;
+		}
+
+		void capture_if_requested(IDirect3DDevice9* dev, IShaderAPIDX8* shaderapi,
+			const prim_fvf_context& ctx, const CMeshDX8* mesh, const UINT stream_stride)
+		{
+			if (!dev || !shaderapi || !mesh || (!g_state.once && !g_state.continuous)) return;
+			const ULONGLONG now = GetTickCount64();
+			if (!g_state.once && g_state.continuous && now - g_state.last_continuous_tick < k_continuous_capture_interval_ms) return;
+			g_state.last_continuous_tick = now;
+
+			IDirect3DVertexShader9* vs = nullptr;
+			IDirect3DPixelShader9* ps = nullptr;
+			dev->GetVertexShader(&vs);
+			dev->GetPixelShader(&ps);
+			std::vector<BYTE> vs_blob;
+			std::vector<BYTE> ps_blob;
+			get_shader_blob(vs, vs_blob);
+			get_shader_blob(ps, ps_blob);
+			const std::uint64_t vs_hash = vs_blob.empty() ? 0u : fnv1a64_bytes(vs_blob.data(), vs_blob.size());
+			const std::uint64_t ps_hash = ps_blob.empty() ? 0u : fnv1a64_bytes(ps_blob.data(), ps_blob.size());
+
+			const auto constants = capture_constants(dev);
+			const std::uint64_t constants_signature = constants_hash(constants);
+			std::uint64_t signature = combine_hash(utils::string_hash64(ctx.info.material_name), vs_hash);
+			signature = combine_hash(signature, ps_hash);
+			signature = combine_hash(signature, constants_signature);
+			for (const int handle : ctx.info.buffer_state.m_BoundTexture) {
+				signature = combine_hash(signature, static_cast<std::uint64_t>(static_cast<std::uint32_t>(handle)));
+			}
+
+			const bool unique = g_state.signatures.insert(signature).second;
+			if (!g_state.once && !unique) {
+				if (vs) vs->Release();
+				if (ps) ps->Release();
+				return;
+			}
+			g_state.once = false;
+			if (g_state.signatures.size() >= k_max_unique_captures) {
+				g_state.continuous = false;
+			}
+
+			const auto root = capture_root_path();
+			const auto material_tag = sanitize_file_name(ctx.info.material_name);
+			const auto capture_dir = root / std::format("capture_{:04}_{}_{}", ++g_state.capture_index, now, material_tag);
+			const auto texture_dir = capture_dir / "textures";
+			std::error_code ec;
+			std::filesystem::create_directories(texture_dir, ec);
+
+			write_binary(capture_dir / std::format("vs_{:016x}.bin", vs_hash), vs_blob);
+			write_binary(capture_dir / std::format("ps_{:016x}.bin", ps_hash), ps_blob);
+			write_float_constants(capture_dir / "vs_float_constants.csv", constants.vs_float);
+			write_float_constants(capture_dir / "ps_float_constants.csv", constants.ps_float);
+			write_int_constants(capture_dir / "vs_int_constants.csv", constants.vs_int);
+			write_int_constants(capture_dir / "ps_int_constants.csv", constants.ps_int);
+			write_bool_constants(capture_dir / "vs_bool_constants.csv", constants.vs_bool);
+			write_bool_constants(capture_dir / "ps_bool_constants.csv", constants.ps_bool);
+
+			std::unordered_map<std::uintptr_t, texture_probe_s> texture_cache;
+			auto inspect = [&](IDirect3DBaseTexture9* texture) -> texture_probe_s {
+				if (!texture) return {};
+				const auto key = reinterpret_cast<std::uintptr_t>(texture);
+				if (const auto it = texture_cache.find(key); it != texture_cache.end()) return it->second;
+				auto probe = probe_texture(texture, texture_dir);
+				texture_cache.emplace(key, probe);
+				return probe;
+			};
+
+			DWORD fvf = 0u;
+			dev->GetFVF(&fvf);
+			D3DVERTEXELEMENT9 declaration[MAX_FVF_DECL_SIZE]{};
+			UINT declaration_count = MAX_FVF_DECL_SIZE;
+			IDirect3DVertexDeclaration9* vertex_declaration = nullptr;
+			if (SUCCEEDED(dev->GetVertexDeclaration(&vertex_declaration)) && vertex_declaration) {
+				if (FAILED(vertex_declaration->GetDeclaration(declaration, &declaration_count))) declaration_count = 0u;
+				vertex_declaration->Release();
+			} else {
+				declaration_count = 0u;
+			}
+
+			std::ofstream file(capture_dir / "capture.json", std::ios::trunc);
+			if (file.is_open())
+			{
+				file << "{\n"
+					<< "\"schema\":\"l4d2_native_wound_payload_v1\",\n"
+					<< "\"capture_index\":" << g_state.capture_index << ",\n"
+					<< "\"tick_ms\":" << now << ",\n"
+					<< "\"signature\":\"0x" << std::hex << signature << std::dec << "\",\n"
+					<< "\"material_name\":\"" << json_escape(ctx.info.material_name) << "\",\n"
+					<< "\"shader_name\":\"" << json_escape(ctx.info.shader_name) << "\",\n"
+					<< "\"mesh_vertex_format\":\"0x" << std::hex << mesh->m_VertexFormat << std::dec << "\",\n"
+					<< "\"stream_stride\":" << stream_stride << ",\n"
+					<< "\"fvf\":\"0x" << std::hex << fvf << std::dec << "\",\n"
+					<< "\"buffer_vertex_shader_pointer\":\"0x" << std::hex << reinterpret_cast<std::uintptr_t>(ctx.info.buffer_state.m_VertexShader) << std::dec << "\",\n"
+					<< "\"buffer_pixel_shader_pointer\":\"0x" << std::hex << reinterpret_cast<std::uintptr_t>(ctx.info.buffer_state.m_PixelShader) << std::dec << "\",\n"
+					<< "\"vertex_shader_hash\":\"0x" << std::hex << vs_hash << std::dec << "\",\n"
+					<< "\"pixel_shader_hash\":\"0x" << std::hex << ps_hash << std::dec << "\",\n"
+					<< "\"constants_hash\":\"0x" << std::hex << constants_signature << std::dec << "\",\n"
+					<< "\"active_wounds\":null,\n"
+					<< "\"wound_register_mapping_confirmed\":false,\n"
+					<< "\"legacy_texture4_transport_candidate\":true,\n";
+
+				file << "\"vertex_declaration\":[";
+				for (UINT i = 0u; i < declaration_count; ++i)
+				{
+					if (i) file << ',';
+					const auto& e = declaration[i];
+					file << "{\"stream\":" << e.Stream << ",\"offset\":" << e.Offset
+						<< ",\"type\":" << static_cast<unsigned int>(e.Type)
+						<< ",\"method\":" << static_cast<unsigned int>(e.Method)
+						<< ",\"usage\":" << static_cast<unsigned int>(e.Usage)
+						<< ",\"usage_index\":" << static_cast<unsigned int>(e.UsageIndex) << '}';
+				}
+				file << "],\n";
+
+				file << "\"source_bound_textures\":[";
+				for (std::uint32_t slot = 0u; slot < k_source_texture_count; ++slot)
+				{
+					if (slot) file << ',';
+					const int handle = ctx.info.buffer_state.m_BoundTexture[slot];
+					auto* texture = handle >= 0 ? shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, handle) : nullptr;
+					file << "{\"slot\":" << slot << ",\"handle\":" << handle << ",\"texture\":";
+					write_texture_json(file, inspect(texture));
+					file << '}';
+				}
+				file << "],\n";
+
+				file << "\"device_textures_before_fixed_function\":[";
+				for (std::uint32_t slot = 0u; slot < k_device_texture_count; ++slot)
+				{
+					if (slot) file << ',';
+					IDirect3DBaseTexture9* texture = nullptr;
+					dev->GetTexture(slot, &texture);
+					file << "{\"slot\":" << slot << ",\"texture\":";
+					write_texture_json(file, inspect(texture));
+					file << '}';
+					if (texture) texture->Release();
+				}
+				file << "],\n";
+				write_material_vars(file, ctx.info.material);
+				file << "\n}\n";
+			}
+
+			if (vs) vs->Release();
+			if (ps) ps->Release();
+			game::console();
+			printf("[L4D2 WOUND] Capture %u zapisany: %s\\n", g_state.capture_index, capture_dir.string().c_str());
+		}
+
+		void capture_once()
+		{
+			g_state.once = true;
+			game::console();
+			printf("[L4D2 WOUND] Uzbrojono jednorazowy capture nastepnego draw calla Infected.\\n");
+		}
+
+		void toggle_continuous()
+		{
+			g_state.continuous = !g_state.continuous;
+			game::console();
+			printf("[L4D2 WOUND] Continuous capture: %s (unikalne sygnatury, max %u).\\n",
+				g_state.continuous ? "ON" : "OFF", k_max_unique_captures);
+		}
+
+		void clear_session()
+		{
+			g_state.signatures.clear();
+			g_state.capture_index = 0u;
+			g_state.last_continuous_tick = 0u;
+			game::console();
+			printf("[L4D2 WOUND] Wyczyszczono pamiec sygnatur. Pliki na dysku pozostaly bez zmian.\\n");
+		}
+
+		void print_status()
+		{
+			game::console();
+			printf("[L4D2 WOUND] once=%d continuous=%d captures=%u unique=%zu root=%s\\n",
+				g_state.once ? 1 : 0, g_state.continuous ? 1 : 0, g_state.capture_index,
+				g_state.signatures.size(), capture_root_path().string().c_str());
+		}
 	}
 
 	D3DCOLORVALUE g_old_light_to_texture_color = {};
@@ -106,63 +881,215 @@ namespace components
 		}
 	}
 
-
-	// Uses unused Renderstate 149 to set per drawcall modifiers
-	// ~ req. runtime changes
-	void model_render::set_remix_modifier(IDirect3DDevice9* dev, RemixModifier mod, bool remove_mod)
+	enum REMIX_MODIFIER : std::uint32_t
 	{
-		primctx.save_rs(dev, RS_149_REMIX_MODIFIER);
+		NONE = 0,
+		INFECTED = 1 << 0,
+		EMISSIVE_TWEAK = 1 << 1,
+		XORXOR_WATER_PASSTHROUGH = 1 << 2,
+	};
 
-		if (remove_mod) {
-			primctx.modifiers.remix_modifier &= ~mod;
-		} else {
-			primctx.modifiers.remix_modifier |= mod;
-		}
+	constexpr DWORD XORXOR_WATER_SIGNATURE = 0x58574154u; // ASCII: XWAT
+	constexpr auto RS_MODEL_DRAW_PACKET_ID = static_cast<D3DRENDERSTATETYPE>(REMIX_SOURCE_RS_MODEL_DRAW_PACKET_ID);
+	constexpr auto RS_MODEL_DRAW_PACKET_FLAGS = static_cast<D3DRENDERSTATETYPE>(REMIX_SOURCE_RS_MODEL_DRAW_PACKET_FLAGS);
 
-		dev->SetRenderState((D3DRENDERSTATETYPE)RS_149_REMIX_MODIFIER, static_cast<DWORD>(primctx.modifiers.remix_modifier));
-	}
-
-	// uses unused Renderstate 149 (mod) & 169 to tweak the emissive intensity of remix materials (legacy/opaque)
+	// RS149 carries compatibility ownership/modifier bits. RS169 is the current
+	// Xorxor/runtime emissive scalar payload used only when EMISSIVE_TWEAK is set.
 	// ~ currently req. runtime changes
-	// ~ req. runtime changes --> remixTempFloat01FromD3D
-	void model_render::set_remix_emissive_intensity(IDirect3DDevice9* dev, float intensity)
+	void set_remix_emissive_intensity(IDirect3DDevice9* dev, prim_fvf_context& ctx, float intensity)
 	{
-		set_remix_modifier(dev, RemixModifier::EmissiveScalar);
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)149);
+		dev->SetRenderState((D3DRENDERSTATETYPE)149, EMISSIVE_TWEAK);
 
-		primctx.save_rs(dev, RS_169_EMISSIVE_SCALE);
-		dev->SetRenderState((D3DRENDERSTATETYPE)RS_169_EMISSIVE_SCALE, *reinterpret_cast<DWORD*>(&intensity));
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)169);
+		dev->SetRenderState((D3DRENDERSTATETYPE)169, *reinterpret_cast<DWORD*>(&intensity));
 	}
 
-	// Uses unused Renderstate 42 to set remix texture categories
-	// ~ req. runtime changes
-	void model_render::set_remix_texture_categories(IDirect3DDevice9* dev, const InstanceCategories& cat, bool remove_category)
+	// uses unused Renderstate 42 to set remix texture categories - RemixInstanceCategories
+	// ~ currently req. runtime changes
+	void set_remix_texture_categories(IDirect3DDevice9* dev, prim_fvf_context& ctx, const std::uint32_t& cat)
 	{
-		primctx.save_rs(dev, RS_42_TEXTURE_CATEGORY);
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)42);
+		dev->SetRenderState((D3DRENDERSTATETYPE)42, cat);
+	}
 
-		if (remove_category) {
-			primctx.modifiers.remix_instance_categories &= ~cat;
-		} else {
-			primctx.modifiers.remix_instance_categories |= cat;
+	// RS150 stores the Xorxor-compatible low DWORD and unused RS153 stores the high DWORD of a custom
+	// 64-bit Remix material hash. Older 32-bit call sites explicitly clear RS153. RS151 is D3DRS_VERTEXBLEND.
+	void set_remix_texture_hash(IDirect3DDevice9* dev, prim_fvf_context& ctx, const std::uint32_t& hash)
+	{
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)150);
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)153);
+		dev->SetRenderState((D3DRENDERSTATETYPE)150, hash);
+		dev->SetRenderState((D3DRENDERSTATETYPE)153, 0u);
+	}
+
+	void set_remix_texture_hash64(IDirect3DDevice9* dev, prim_fvf_context& ctx, const std::uint64_t hash)
+	{
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)150);
+		ctx.save_rs(dev, (D3DRENDERSTATETYPE)153);
+		dev->SetRenderState((D3DRENDERSTATETYPE)150, static_cast<DWORD>(hash & 0xffffffffull));
+		dev->SetRenderState((D3DRENDERSTATETYPE)153, static_cast<DWORD>(hash >> 32u));
+	}
+
+	namespace xorxor_water
+	{
+		namespace
+		{
+			status_s g_status;
+
+			bool is_water_shader(const std::string_view shader_name)
+			{
+				return shader_name.starts_with("Wa") && shader_name.contains("Water");
+			}
+
+			bool is_supported_vertex_format(const std::uint64_t vertex_format)
+			{
+				return vertex_format == 0x480033u || vertex_format == 0x80033u;
+			}
+
+			void clear_custom_material_hash(IDirect3DDevice9* dev, prim_fvf_context& ctx)
+			{
+				// Xorxor's original first water layer used the native texture identity.
+				// Explicitly clear both custom hash DWORDs so Source Material Bridge and
+				// stable-hash authoring cannot replace that identity.
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(150));
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(153));
+				dev->SetRenderState(static_cast<D3DRENDERSTATETYPE>(150), 0u);
+				dev->SetRenderState(static_cast<D3DRENDERSTATETYPE>(153), 0u);
+			}
+
+			void mark_passthrough(IDirect3DDevice9* dev, prim_fvf_context& ctx)
+			{
+				DWORD modifiers = 0u;
+				dev->GetRenderState(static_cast<D3DRENDERSTATETYPE>(149), &modifiers);
+				if (modifiers == 0xfefefefeu) {
+					modifiers = 0u;
+				}
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(149));
+				dev->SetRenderState(
+					static_cast<D3DRENDERSTATETYPE>(149),
+					modifiers | XORXOR_WATER_PASSTHROUGH);
+
+				// A second exact signature lets DXVK recognize the passive water path even
+				// when the global unused-render-state option is disabled. RS164 is restored
+				// with the rest of the prim context after both Xorxor layers are submitted.
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(164));
+				dev->SetRenderState(static_cast<D3DRENDERSTATETYPE>(164), XORXOR_WATER_SIGNATURE);
+			}
 		}
 
-		dev->SetRenderState((D3DRENDERSTATETYPE)RS_42_TEXTURE_CATEGORY, static_cast<DWORD>(primctx.modifiers.remix_instance_categories));
+		bool prepare(IDirect3DDevice9* dev, IShaderAPIDX8* shaderapi, CMeshDX8* mesh, prim_fvf_context& ctx)
+		{
+			if (!mesh || !is_water_shader(ctx.info.shader_name)) {
+				return false;
+			}
+
+			++g_status.water_shader_passes;
+			static_scene_cache::quarantine_xorxor_water();
+			g_status.last_vertex_format = static_cast<std::uint32_t>(mesh->m_VertexFormat);
+			g_status.last_material = std::string(ctx.info.material_name);
+			g_status.last_shader = std::string(ctx.info.shader_name);
+
+			// Every Source Water pass keeps native identity and receives the passive
+			// ownership marker, even when its vertex format is not one of the two
+			// historical dual-layer formats. This prevents generic DXVK synthesis from
+			// touching fallback/cheap-water passes while still leaving Source in charge.
+			clear_custom_material_hash(dev, ctx);
+			mark_passthrough(dev, ctx);
+			++g_status.stable_hash_bypasses;
+
+			if (!is_supported_vertex_format(mesh->m_VertexFormat))
+			{
+				++g_status.unsupported_vertex_formats;
+				return false;
+			}
+
+			IMaterialVar* base_texture_var = nullptr;
+			if (!has_materialvar(ctx.info.material, "$basetexture", &base_texture_var) ||
+				!base_texture_var || base_texture_var->vftable->IsDefined(base_texture_var))
+			{
+				return false;
+			}
+
+			IMaterialVar* bottom_material_var = nullptr;
+			if (!has_materialvar(ctx.info.material, "$bottommaterial", &bottom_material_var))
+			{
+				// Original Xorxor behavior: suppress the separate beneath pass.
+				ctx.modifiers.do_not_render = true;
+				++g_status.hidden_beneath_passes;
+				return true;
+			}
+
+			const auto& settings = map_settings::get_map_settings();
+			ctx.modifiers.as_water = true;
+			ctx.modifiers.do_not_render = false;
+			ctx.modifiers.og_mesh_z_offset = settings.water_offset_bottom;
+			ctx.modifiers.dual_render_with_specified_texture = true;
+			ctx.modifiers.dual_render_with_specified_texture_blend_add = false;
+			ctx.modifiers.dual_render_texture_z_offset = settings.water_offset_top;
+			ctx.modifiers.dual_render_texture = shaderapi->vtbl->GetD3DTexture(
+				shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[2]);
+
+			IDirect3DBaseTexture9* flow_texture = shaderapi->vtbl->GetD3DTexture(
+				shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[4]);
+			if (flow_texture)
+			{
+				ctx.save_texture(dev, 0u);
+				dev->SetTexture(0u, flow_texture);
+			}
+
+			if (!ctx.modifiers.dual_render_texture || !flow_texture) {
+				++g_status.missing_surface_textures;
+			}
+
+			D3DXMATRIX scale_matrix;
+			D3DXMatrixScaling(
+				&scale_matrix,
+				1.5f * settings.water_uv_scale,
+				1.5f * settings.water_uv_scale,
+				1.0f);
+
+			ctx.save_ss(dev, 0u, D3DSAMP_ADDRESSU);
+			ctx.save_ss(dev, 0u, D3DSAMP_ADDRESSV);
+			dev->SetSamplerState(0u, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+			dev->SetSamplerState(0u, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+
+			ctx.set_texture_transform(dev, &scale_matrix);
+			ctx.save_tss(dev, 0u, D3DTSS_TEXTURETRANSFORMFLAGS);
+			dev->SetTextureStageState(0u, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+
+			++g_status.converted_dual_draws;
+			return true;
+		}
+
+		status_s snapshot()
+		{
+			return g_status;
+		}
+
+		void note_static_cache_bypass()
+		{
+			++g_status.static_cache_bypasses;
+		}
+
+		void print_status()
+		{
+			game::console();
+			printf(
+				"[Xorxor Water] passes=%llu dual=%llu beneath_hidden=%llu unsupported_vf=%llu missing_textures=%llu hash_bypass=%llu static_cache_bypass=%llu last_vf=0x%X material='%s' shader='%s'\n",
+				static_cast<unsigned long long>(g_status.water_shader_passes),
+				static_cast<unsigned long long>(g_status.converted_dual_draws),
+				static_cast<unsigned long long>(g_status.hidden_beneath_passes),
+				static_cast<unsigned long long>(g_status.unsupported_vertex_formats),
+				static_cast<unsigned long long>(g_status.missing_surface_textures),
+				static_cast<unsigned long long>(g_status.stable_hash_bypasses),
+				static_cast<unsigned long long>(g_status.static_cache_bypasses),
+				g_status.last_vertex_format,
+				g_status.last_material.c_str(),
+				g_status.last_shader.c_str());
+		}
 	}
 
-	// Uses unused Renderstate 150 to set custom remix hash
-	// ~ req. runtime changes
-	void model_render::set_remix_texture_hash(IDirect3DDevice9* dev, const std::uint32_t& hash)
-	{
-		primctx.save_rs(dev, RS_150_TEXTURE_HASH);
-		dev->SetRenderState((D3DRENDERSTATETYPE)RS_150_TEXTURE_HASH, hash);
-	}
-
-	// Uses unused Renderstate 220 re-hash the original hash with a given seed
-	// ~ req. runtime changes
-	void model_render::set_remix_texture_hash_modifier(IDirect3DDevice9* dev, const std::uint32_t& seed)
-	{
-		primctx.save_rs(dev, RS_220_HASH_MODIFIER_SEED);
-		dev->SetRenderState((D3DRENDERSTATETYPE)RS_220_HASH_MODIFIER_SEED, seed);
-	}
 
 
 	// can be used to figure out the layout of the vertex buffer
@@ -235,6 +1162,12 @@ namespace components
 	// detoured 'CModelRender::DrawModelExecute'
 	void __fastcall tbl_hk::model_renderer::DrawModelExecute::Detour(void* ecx, void* edx, const DrawModelState_t& state, const ModelRenderInfo_t& pInfo, matrix3x4_t* pCustomBoneToWorld)
 	{
+		if (!compat_gameplay_render_active())
+		{
+			tbl_hk::model_renderer::table.original<FN>(index)(ecx, edx, state, pInfo, pCustomBoneToWorld);
+			return;
+		}
+
 		// draw nocull markers before drawing the first model - no particular reason besides that we dont want to draw them before rendering the sky
 		if (game::get_viewid() != VIEW_3DSKY && !model_render::get()->m_drew_model)
 		{
@@ -248,7 +1181,7 @@ namespace components
 
 		for (const auto& hide_mdl_with_radius : hmsettings.radii)
 		{
-			if (utils::float_equal(pInfo.pModel->radius, hide_mdl_with_radius))
+			if (pInfo.pModel->radius == hide_mdl_with_radius)
 			{
 				ignore = true;
 				break;
@@ -268,13 +1201,50 @@ namespace components
 			}
 		}
 
+		// Optional CPU-skinning mitigation. In performance profiles this can skip far
+		// common infected/ragdoll-style animated meshes before the expensive compat path.
+		// Foliage is intentionally not touched here.
+		if (!ignore && dynamic_lighting::should_skip_model_for_cpu_skin_budget(pInfo))
+		{
+			ignore = true;
+		}
+
 		// check for attached lights
-		remix_lights::on_draw_model_exec(pInfo);
+		if (!ignore) {
+			remix_lights::on_draw_model_exec(pInfo);
+		}
 
 		if (!ignore)
 		{
-			// draw the model
+			bool source_static_candidate = false;
+			// V20.2.3: the VModelInfoClient004 classifier is opt-in. A mismatched
+			// L4D2 vtable layout can access an invalid virtual slot on the first
+			// static prop while the map is loading. World/BSP capture does not need it.
+			if (static_scene_cache::model_info_classifier_enabled())
+			{
+				if (const auto intf = interfaces::get(); intf && intf->m_model_info &&
+					intf->m_model_info->vftable && pInfo.pModel)
+				{
+					const auto model_info = intf->m_model_info;
+					source_static_candidate =
+						pInfo.entity_index < 0 &&
+						model_info->vftable->UsesStaticLighting &&
+						model_info->vftable->ModelHasMaterialProxy &&
+						model_info->vftable->IsTranslucent &&
+						model_info->vftable->IsTranslucentTwoPass &&
+						model_info->vftable->UsesStaticLighting(model_info, pInfo.pModel) &&
+						!model_info->vftable->ModelHasMaterialProxy(model_info, pInfo.pModel) &&
+						!model_info->vftable->IsTranslucent(model_info, pInfo.pModel) &&
+						!model_info->vftable->IsTranslucentTwoPass(model_info, pInfo.pModel);
+				}
+			}
+
+			static_scene_cache::begin_model_draw(pInfo, source_static_candidate);
+			material_exporter::begin_model_draw(pInfo);
+			// draw the model; the nested material passes inherit skin/body/model context
 			tbl_hk::model_renderer::table.original<FN>(index)(ecx, edx, /*oo,*/ state, pInfo, pCustomBoneToWorld);
+			material_exporter::end_model_draw();
+			static_scene_cache::end_model_draw();
 
 			if (cmd::model_info_vis)
 			{
@@ -307,72 +1277,86 @@ namespace components
 
 	void cmeshdx8_renderpass_pre_draw(CMeshDX8* mesh, [[maybe_unused]] /*CPrimList**/ std::uint32_t primlist)
 	{
+		g_compat_primitive_active = compat_gameplay_render_active();
+		if (!g_compat_primitive_active)
+		{
+			model_render::primctx.reset_context();
+			return;
+		}
+		static_scene_cache::on_pre_draw(mesh);
+
 		const auto dev = game::get_d3d_device();
 		IDirect3DVertexBuffer9* buffer9 = nullptr;
 		UINT stride = 0;
 		{
-			UINT ofs = 0; dev->GetStreamSource(0, &buffer9, &ofs, &stride);
+			UINT ofs = 0u;
+			if (SUCCEEDED(dev->GetStreamSource(0, &buffer9, &ofs, &stride)) && buffer9)
+			{
+				// GetStreamSource returns an owned COM reference. Only the stride is
+				// needed below, so release immediately instead of leaking once per draw.
+				buffer9->Release();
+				buffer9 = nullptr;
+			}
 		}
 
 		prim_fvf_context& ctx = model_render::primctx;
 		const auto shaderapi = game::get_shaderapi();
 
-		if (ctx.get_info_for_pass(shaderapi)) 
+		if (!ctx.get_info_for_pass(shaderapi))
 		{
-			// added format check
-			if (mesh->m_VertexFormat == 0x480033 || mesh->m_VertexFormat == 0x80033)
+			// Fail open: the post hook submits the original DrawIndexedPrimitive with
+			// untouched Source state instead of consuming an empty/stale context.
+			++world_ffp_bridge::g_failed_pass_captures;
+			g_compat_primitive_active = false;
+			ctx.reset_context();
+			return;
+		}
+
+		const bool source_metadata_safe_pass = !source_material_special_pass(dev, ctx);
+		{
+			// cmeshdx8_renderpass_post_draw changes sRGB sampling for every draw. Save
+			// it for all passes so map material conversion cannot leak sampler state.
+			ctx.save_ss(dev, 0u, D3DSAMP_SRGBTEXTURE);
+
+			const bool source_water_shader =
+				ctx.info.shader_name.starts_with("Wa") && ctx.info.shader_name.contains("Water");
+			xorxor_water::prepare(dev, shaderapi, mesh, ctx);
+
+			// Glow/halo, forced override, depth, shadow, wireframe and IGNOREZ passes are
+			// metadata-only exclusions. Never publish a hash or ABI packet for them and
+			// explicitly clear packet render states so a prior model pass cannot bleed in.
+			if (!source_metadata_safe_pass)
 			{
-				if (ctx.info.shader_name.starts_with("Wa") && ctx.info.shader_name.contains("Water"))
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(150));
+				ctx.save_rs(dev, static_cast<D3DRENDERSTATETYPE>(153));
+				ctx.save_rs(dev, RS_MODEL_DRAW_PACKET_ID);
+				ctx.save_rs(dev, RS_MODEL_DRAW_PACKET_FLAGS);
+				dev->SetRenderState(static_cast<D3DRENDERSTATETYPE>(150), 0u);
+				dev->SetRenderState(static_cast<D3DRENDERSTATETYPE>(153), 0u);
+				dev->SetRenderState(RS_MODEL_DRAW_PACKET_ID, 0u);
+				dev->SetRenderState(RS_MODEL_DRAW_PACKET_FLAGS, 0u);
+			}
+			else if (source_water_shader)
+			{
+				if (material_exporter::m_capture_enabled)
+					material_exporter::capture_draw(ctx.info.material, shaderapi, ctx.info.buffer_state);
+			}
+			else
+			{
+				const auto source_material_hash = material_exporter::capture_draw(
+					ctx.info.material, shaderapi, ctx.info.buffer_state);
+				if ((material_exporter::m_inject_stable_hashes || material_exporter::m_source_material_bridge_enabled) &&
+					source_material_hash != 0u)
 				{
-					IMaterialVar* var = nullptr;
-					if (has_materialvar(ctx.info.material, "$basetexture", &var)) 
-					{
-						// if material has NO defined basetexture
-						if (var && !var->vftable->IsDefined(var))
-						{
-							// check if it has a defined bottommaterial
-							var = nullptr;
-							const auto has_bottom_mat = has_materialvar(ctx.info.material, "$bottommaterial", &var);
-
-							if (has_bottom_mat)
-							{
-								const auto& ms = map_settings::get_map_settings();
-
-								// we only need one surface
-								ctx.modifiers.as_water = true;
-								ctx.modifiers.og_mesh_z_offset = ms.water_offset_bottom;
-								ctx.modifiers.dual_render_with_specified_texture = true;
-								ctx.modifiers.dual_render_texture_z_offset = ms.water_offset_top; //0.5f;
-								ctx.modifiers.dual_render_texture = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[2]);
-								
-								// assign flowmap
-								IDirect3DBaseTexture9* tex = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[4]);
-								if (tex)
-								{
-									ctx.save_texture(dev, 0);
-									dev->SetTexture(0, tex);
-								}
-
-								// scale water uv
-								D3DXMATRIX scaleMatrix; // create a scaling matrix
-								D3DXMatrixScaling(&scaleMatrix, 1.5f * ms.water_uv_scale, 1.5f * ms.water_uv_scale, 1.0f);
-
-								ctx.save_ss(dev, D3DSAMP_ADDRESSU);
-								ctx.save_ss(dev, D3DSAMP_ADDRESSV);
-								dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-								dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-
-								ctx.set_texture_transform(dev, &scaleMatrix);
-								ctx.save_tss(dev, D3DTSS_TEXTURETRANSFORMFLAGS);
-								dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-							}
-
-							// ignore 'beneath'
-							else {
-								ctx.modifiers.do_not_render = true;
-							}
-						}
-					}
+					set_remix_texture_hash64(dev, ctx, source_material_hash);
+				}
+				const auto model_packet_id = material_exporter::current_model_draw_packet_id();
+				if (model_packet_id != 0u)
+				{
+					ctx.save_rs(dev, RS_MODEL_DRAW_PACKET_ID);
+					ctx.save_rs(dev, RS_MODEL_DRAW_PACKET_FLAGS);
+					dev->SetRenderState(RS_MODEL_DRAW_PACKET_ID, model_packet_id);
+					dev->SetRenderState(RS_MODEL_DRAW_PACKET_FLAGS, material_exporter::current_model_draw_packet_flags());
 				}
 			}
 		}
@@ -383,15 +1367,25 @@ namespace components
 		dev->SetTransform(D3DTS_VIEW, &ctx.info.buffer_state.m_Transform[1]);
 		dev->SetTransform(D3DTS_PROJECTION, &ctx.info.buffer_state.m_Transform[2]);
 
+		// Special Source helper passes keep their original programmable pipeline. In
+		// particular, forced glow/halo overrides must never enter the Studio FFP bridge,
+		// otherwise the interactive model is rendered as a solid white replacement mesh.
+		if (!source_metadata_safe_pass)
+		{
+			ctx.modifiers.do_not_render = suppress_source_interaction_helper(ctx);
+		}
+
 		// shader: VertexLitGeneric (infected - player model - viewmodel - dynamic props)
 		// > models/weapons/melee/crowbar
 		// > models/props_junk/wood_palletcrate001a
 		// shader: Refract_DX90
 		// > vgui/hud/scope_sniper_ul
-		if (mesh->m_VertexFormat == 0xa0003)
+		else if (mesh->m_VertexFormat == 0xa0003)
 		{
 			//ctx.modifiers.do_not_render = true;
 			bool use_shader = false;
+			bool infected_shader_path = false;
+			int model_albedo_sampler = 0;
 
 			// viewmodel
 			if (ctx.info.buffer_state.m_Transform[2].m[3][2] == -1.00003338f)
@@ -408,17 +1402,16 @@ namespace components
 				{
 					ctx.save_texture(dev, 0);
 					dev->SetTexture(0, basemap2);
+					model_albedo_sampler = 1;
 					ctx.modifiers.as_temp_unused = true;
 				}
 			}
 
-			const auto im = imgui::get();
-
-			if (ctx.info.shader_name == "Infected" && !im->m_dev_disable_infected_shader && (
-					ctx.info.material_name.contains("/l4d2/") || 
-					(ctx.info.material_name.contains("/l4d1/cim_") && !ctx.info.material_name.ends_with("pilot"))
-				)) // ignore "cim_fallen_survivor_l4d1_pilot.vmt"
+			if (ctx.info.shader_name == "Infected" && 
+				(ctx.info.material_name.contains("/l4d2/") || 
+				 (ctx.info.material_name.contains("/l4d1/cim_") && !ctx.info.material_name.ends_with("pilot")))) // ignore "cim_fallen_survivor_l4d1_pilot.vmt"
 			{
+				infected_shader_path = true;
 				//ctx.modifiers.do_not_render = true;
 
 				//IMaterialVar* var = nullptr;
@@ -439,6 +1432,9 @@ namespace components
 				// https://cdn.fastly.steamstatic.com/apps/valve/2010/GDC10_ShaderTechniquesL4D2.pdf
 				// https://steamcdn-a.akamaihd.net/apps/valve/2010/gdc2010_vlachos_l4d2wounds.pdf
 
+				// Capture the original Source shader state before any texture remap or shader removal.
+				wound_capture::capture_if_requested(dev, shaderapi, ctx, mesh, stride);
+
 				// gradient
 				if (const auto tex = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[5]); tex)
 				{
@@ -449,11 +1445,12 @@ namespace components
 				// detail
 				if (const auto tex = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[4]); tex)
 				{
-					//ctx.save_texture(dev, 0);
+					ctx.save_texture(dev, 2);
 					dev->SetTexture(2, tex);
 				}
 
-				model_render::set_remix_modifier(dev, RemixModifier::InfectedShader);
+				ctx.save_rs(dev, (D3DRENDERSTATETYPE)149);
+				dev->SetRenderState((D3DRENDERSTATETYPE)149, INFECTED);
 
 				float uv_transform[4] = {}; // xy = sprite, zw = gradient z:skin - w:cloth
 				dev->GetPixelShaderConstantF(10, uv_transform, 1); // g_vGradSelect
@@ -478,18 +1475,18 @@ namespace components
 
 				// pack into single RS
 				// 0/1/2..7: skin --- 00/10/20...70: cloth
-				ctx.save_rs(dev, RS_196_INFECTED_SKIN_GRAD);
-				dev->SetRenderState((D3DRENDERSTATETYPE)RS_196_INFECTED_SKIN_GRAD, skin_index + (cloth_index * 10));
+				ctx.save_rs(dev, (D3DRENDERSTATETYPE)196);
+				dev->SetRenderState((D3DRENDERSTATETYPE)196, skin_index + (cloth_index * 10));
 
 
 				// g_vGradSelect - pack two floats into one RS
-				ctx.save_rs(dev, RS_197_INFECTED_GRAD_SELECT);
-				dev->SetRenderState((D3DRENDERSTATETYPE)RS_197_INFECTED_GRAD_SELECT, utils::pack_2f_in_dword(grad_select[0], grad_select[1]));
+				ctx.save_rs(dev, (D3DRENDERSTATETYPE)197);
+				dev->SetRenderState((D3DRENDERSTATETYPE)197, utils::pack_2f_in_dword(grad_select[0], grad_select[1]));
 
 
 				// sprite index - pack two floats into one RS
-				ctx.save_rs(dev, RS_177_INFECTED_SHEET_UV);
-				dev->SetRenderState((D3DRENDERSTATETYPE)RS_177_INFECTED_SHEET_UV, utils::pack_2f_in_dword(uv_transform[0], uv_transform[1]));
+				ctx.save_rs(dev, (D3DRENDERSTATETYPE)177);
+				dev->SetRenderState((D3DRENDERSTATETYPE)177, utils::pack_2f_in_dword(uv_transform[0], uv_transform[1]));
 
 				float roughness_boost = 1.0f; // less = more reflections
 				float normal_boost = 3.0f;
@@ -507,8 +1504,8 @@ namespace components
 				}
 
 				// normal boost & roughness boost - pack two floats into one RS
-				ctx.save_rs(dev, RS_211_INFECTED_NORMAL_ROUGH_BOOST);
-				dev->SetRenderState((D3DRENDERSTATETYPE)RS_211_INFECTED_NORMAL_ROUGH_BOOST, utils::pack_2f_in_dword(normal_boost, roughness_boost));
+				ctx.save_rs(dev, (D3DRENDERSTATETYPE)211);
+				dev->SetRenderState((D3DRENDERSTATETYPE)211, utils::pack_2f_in_dword(normal_boost, roughness_boost));
 				
 
 				// $skintintgradient - $colortintgradient
@@ -565,7 +1562,7 @@ namespace components
 				//if (!playermodel_str.empty() && playermodel_str != "INVALID")
 				//{
 				//	if (ctx.info.material_name.starts_with(playermodel_str)) {
-						model_render::set_remix_texture_categories(dev, InstanceCategories::ThirdPersonPlayerBody | InstanceCategories::ThirdPersonPlayerModel);
+						set_remix_texture_categories(dev, ctx, REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY | REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL);
 				//	}
 				//}
 			}
@@ -573,9 +1570,22 @@ namespace components
 		//NOT_INFECTED_SHADER:
 			if (!use_shader)
 			{
-				ctx.save_vs(dev);
-				dev->SetVertexShader(nullptr);
-				dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX6);
+				if (infected_shader_path)
+				{
+					// Keep the specialised Infected pixel shader and its gradient/detail
+					// samplers. RS177/196/197/211 plus the ABI-v2 packet describe it.
+					ctx.save_vs(dev);
+					dev->SetVertexShader(nullptr);
+					dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX6);
+				}
+				else
+				{
+					// Ordinary players, weapons, viewmodels and props now expose the real
+					// Source basetexture to Remix through an explicit fixed-function pass.
+					studio_model_ffp_bridge::apply(
+						dev, shaderapi, ctx, D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX6,
+						model_albedo_sampler);
+				}
 
 				if (!using_custom_transform) {
 					dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
@@ -597,10 +1607,9 @@ namespace components
 			
 			//lookat_vertex_decl(dev);
 			//ctx.modifiers.do_not_render = true; 
-			ctx.save_vs(dev);
-			dev->SetVertexShader(nullptr);
+			studio_model_ffp_bridge::apply(
+				dev, shaderapi, ctx, D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX3);
 			dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
-			dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX3);
 		}
 
 		// shader: LightmappedGeneric (world geo)
@@ -608,16 +1617,25 @@ namespace components
 		// > concrete/concrete_floor_10
 		else if (mesh->m_VertexFormat == 0x480003)
 		{
-			//ctx.modifiers.do_not_render = true;
-			ctx.save_vs(dev); 
-			dev->SetVertexShader(nullptr);
-			dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX2);
-			dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
+			if (world_ffp_bridge::g_enabled)
+			{
+				world_ffp_bridge::apply(
+					dev, shaderapi, ctx, D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX2);
+			}
+			else
+			{
+				++world_ffp_bridge::g_passthrough_draws;
+				ctx.save_vs(dev);
+				dev->SetVertexShader(nullptr);
+				dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX2);
+				dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
+			}
 		}
 
 		// UnlitGeneric -- stride 0x20
 		// > skybox/urban_horizon_even
-		else if (mesh->m_VertexFormat == 0x80103) {
+		else if (mesh->m_VertexFormat == 0x80103)
+		{
 			ctx.modifiers.do_not_render = false; 
 		}
 
@@ -653,9 +1671,10 @@ namespace components
 				// do not fog HUD elements :D
 				dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
 
-				const auto s_viewFadeColor = l4d2::s_viewFadeColor; //reinterpret_cast<Vector4D*>(CLIENT_BASE + 0x7A3D68);
+				const auto s_viewFadeColor = l4d2::s_viewFadeColor;
 
 				ctx.save_vs(dev);
+				ctx.save_ps(dev);
 				dev->SetVertexShader(nullptr);
 				dev->SetPixelShader(nullptr); // needed
 
@@ -799,7 +1818,7 @@ namespace components
 				bool is_world_ui_text = ctx.info.buffer_state.m_Transform[0].m[3][0] != 0.0f && ctx.info.material_name == "__fontpage";
 
 				if (is_world_ui_text) {
-					model_render::set_remix_texture_categories(dev, InstanceCategories::WorldUI);
+					set_remix_texture_categories(dev, ctx, REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI);
 				}
 				else if (is_world_ui_text)
 				{
@@ -920,10 +1939,19 @@ namespace components
 
 			//lookat_vertex_decl(dev); 
 
-			ctx.save_vs(dev);
-			dev->SetVertexShader(nullptr);
-			dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2);
-			dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
+			if (world_ffp_bridge::g_enabled)
+			{
+				world_ffp_bridge::apply(
+					dev, shaderapi, ctx, D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+			}
+			else
+			{
+				++world_ffp_bridge::g_passthrough_draws;
+				ctx.save_vs(dev);
+				dev->SetVertexShader(nullptr);
+				dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+				dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
+			}
 		}
 
 		// shader: DecalModulate_dx9, Sprite_DX9, Bik
@@ -944,7 +1972,7 @@ namespace components
 			}*/
 
 			if (ctx.info.shader_name.starts_with("Spr")) {
-				model_render::set_remix_texture_categories(dev, InstanceCategories::Particle);
+				set_remix_texture_categories(dev, ctx, REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE);
 			} else if (ctx.info.shader_name == "Bik") {
 				mod_shader = false;
 			}
@@ -1023,7 +2051,7 @@ namespace components
 				dev->SetTransform(D3DTS_PROJECTION, &ctx.info.buffer_state.m_Transform[2]);
 			}
 			else if (ctx.info.material_name.starts_with("particle/fire_")) {
-				model_render::set_remix_emissive_intensity(dev, 10.0f);
+				set_remix_emissive_intensity(dev, ctx, 10.0f);
 			}
 		}
 
@@ -1049,8 +2077,10 @@ namespace components
 		}
 
 		// Sprite shader
-		else if (mesh->m_VertexFormat == 0x914900005)  {
+		else if (mesh->m_VertexFormat == 0x914900005) 
+		{
 			ctx.modifiers.do_not_render = false;
+			//int x = 1; 
 		}
 
 		// shader: Refract_DX90
@@ -1058,8 +2088,8 @@ namespace components
 		else if (mesh->m_VertexFormat == 0x80037)
 		{
 			//lookat_vertex_decl(dev); 
-			model_render::set_remix_emissive_intensity(dev, 0.05f);
-			model_render::set_remix_texture_categories(dev, InstanceCategories::Particle);
+			set_remix_emissive_intensity(dev, ctx, 0.05f); 
+			set_remix_texture_categories(dev, ctx, REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE);
 
 			ctx.save_rs(dev, D3DRS_SRCBLEND);
 			ctx.save_rs(dev, D3DRS_DESTBLEND);
@@ -1141,8 +2171,10 @@ namespace components
 			//dev->SetTexture(0, tex_addons::black);
 		}
 
-		else {
+		else 
+		{
 			ctx.modifiers.do_not_render = false; 
+			//int break_me = 1;  
 		}
 
 #if 0
@@ -1249,11 +2281,22 @@ namespace components
 	void cmeshdx8_renderpass_post_draw([[maybe_unused]] void* device_ptr, D3DPRIMITIVETYPE type, std::int32_t base_vert_index, std::uint32_t min_vert_index, std::uint32_t num_verts, std::uint32_t start_index, std::uint32_t prim_count)
 	{
 		const auto dev = game::get_d3d_device();
-		const auto shaderapi = game::get_shaderapi();
 		auto& ctx = model_render::primctx;
+		if (!g_compat_primitive_active)
+		{
+			dev->DrawIndexedPrimitive(type, base_vert_index, min_vert_index, num_verts, start_index, prim_count);
+			ctx.reset_context();
+			return;
+		}
+		g_compat_primitive_active = false;
+		const auto shaderapi = game::get_shaderapi();
 
 		// 0 = Gamma 1.0 (fixes dark albedo) :: 1 = Gamma 2.2
 		dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, ctx.modifiers.with_high_gamma ? 1u : 0u);
+
+		static_scene_cache::process_draw(dev, ctx, {
+			type, base_vert_index, min_vert_index, num_verts, start_index, prim_count
+		});
 
 		// do not render next surface if set
 		if (!ctx.modifiers.do_not_render)
@@ -1320,7 +2363,9 @@ namespace components
 
 
 				// assign basemap2 to textureslot 0
-				if (const auto basemap2 = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[7]); basemap2) {
+				if (const auto basemap2 = shaderapi->vtbl->GetD3DTexture(shaderapi, nullptr, ctx.info.buffer_state.m_BoundTexture[7]);
+					basemap2)
+				{
 					dev->SetTexture(0, basemap2);
 				}
 
@@ -1350,6 +2395,10 @@ namespace components
 
 				// restore texture, renderstates and texturestates
 				dev->SetTexture(0, og_tex0);
+				if (og_tex0) {
+					og_tex0->Release();
+					og_tex0 = nullptr;
+				}
 				dev->SetRenderState(D3DRS_ALPHABLENDENABLE, og_alphablend);
 				dev->SetRenderState(D3DRS_SRCBLEND, og_srcblend);
 				dev->SetRenderState(D3DRS_DESTBLEND, og_destblend);
@@ -1392,7 +2441,7 @@ namespace components
 				ctx.save_rs(dev, D3DRS_ZENABLE);
 				dev->SetRenderState(D3DRS_ZENABLE, FALSE);
 
-				model_render::set_remix_texture_categories(dev, InstanceCategories::WorldMatte | InstanceCategories::IgnoreOpacityMicromap);
+				set_remix_texture_categories(dev, ctx, REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_MATTE | REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_OPACITY_MICROMAP);
 			}
 
 			if (ctx.modifiers.dual_render_texture_z_offset != 0.0f)
@@ -1401,15 +2450,20 @@ namespace components
 				dev->SetTransform(D3DTS_WORLD, &ctx.info.buffer_state.m_Transform[0]);
 			}
 
-			if (ctx.modifiers.as_water) {
-				model_render::set_remix_texture_hash(dev, utils::string_hash32(ctx.info.material_name));
+			if (ctx.modifiers.as_water)
+			{
+				set_remix_texture_hash(dev, ctx, utils::string_hash32(ctx.info.material_name));
 			}
 
 			// re-draw surface
 			dev->DrawIndexedPrimitive(type, base_vert_index, min_vert_index, num_verts, start_index, prim_count);
 
-			// restore texture
+			// restore texture and release the reference returned by GetTexture.
 			dev->SetTexture(0, og_tex0);
+			if (og_tex0) {
+				og_tex0->Release();
+				og_tex0 = nullptr;
+			}
 		}
 
 		add_light_to_texture_color_restore();
@@ -1466,9 +2520,11 @@ namespace components
 		float startfadesize = 0.0f;
 		float endfadesize = 0.0f;
 
+
 		BufferedState_t buffer_state;
 		std::string mat_name;
 
+		
 		if (const auto shaderapi = game::get_shaderapi(); shaderapi)
 		{
 			shaderapi->vtbl->GetBufferedState(shaderapi, nullptr, &buffer_state);
@@ -1712,6 +2768,8 @@ namespace components
 
 				*src_vTint = D3DCOLOR_COLORVALUE(tint.x, tint.y, tint.z, tint.w);
 			}
+
+			
 		}
 	}
 
@@ -1738,7 +2796,8 @@ namespace components
 	{
 		const auto dev = game::get_d3d_device();
 
-		auto CatmullRomSpline = [](const Vector4D& a, const Vector4D& b, const Vector4D& c, const Vector4D& d, const float t) {
+		auto CatmullRomSpline = [](const Vector4D& a, const Vector4D& b, const Vector4D& c, const Vector4D& d, const float t)
+			{
 				return b + 0.5f * t * (c - a + t * (2.0f * a - 5.0f * b + 4.0f * c - d + t * (-a + 3.0f * b - 3.0f * c + d)));
 			};
 
@@ -1904,6 +2963,12 @@ namespace components
 
 		int R_StudioDrawStaticMesh_hk(const CStudioRender* studio)
 		{
+			// V21.8: cache the model's compiled QC $cdmaterials search paths before
+			// the material draw reaches Auto PBR. This resolves mesh-local names such
+			// as "combine_elite" to their real materials/models/... VMT.
+			if (studio && studio->m_pStudioHdr)
+				material_exporter::register_model_material_paths(studio->m_pStudioHdr);
+
 			if (imgui::get()->m_debug_disable_unbake) {
 				return 0;
 			}
@@ -2025,6 +3090,154 @@ namespace components
 	// #
 	// Commands
 
+	ConCommand xo_static_scene_experimental_unlock_cmd{};
+	void xo_static_scene_experimental_unlock_fn()
+	{
+		static_scene_cache::set_experimental_acknowledged(!static_scene_cache::experimental_acknowledged());
+	}
+
+	ConCommand xo_static_scene_profile_safe_cmd{};
+	void xo_static_scene_profile_safe_fn()
+	{
+		static_scene_cache::activate_experimental_profile(static_scene_cache::experimental_profile::safe_preview);
+	}
+
+	ConCommand xo_static_scene_profile_full_bsp_cmd{};
+	void xo_static_scene_profile_full_bsp_fn()
+	{
+		static_scene_cache::activate_experimental_profile(static_scene_cache::experimental_profile::full_bsp);
+	}
+
+	ConCommand xo_static_scene_profile_full_scene_cmd{};
+	void xo_static_scene_profile_full_scene_fn()
+	{
+		static_scene_cache::activate_experimental_profile(static_scene_cache::experimental_profile::full_scene);
+	}
+
+	ConCommand xo_static_scene_experimental_disable_cmd{};
+	void xo_static_scene_experimental_disable_fn() { static_scene_cache::disable_experimental(); }
+
+	ConCommand xo_static_scene_experimental_reset_cmd{};
+	void xo_static_scene_experimental_reset_fn() { static_scene_cache::reset_experimental_defaults(); }
+
+	ConCommand xo_static_scene_toggle_cmd{};
+	void xo_static_scene_toggle_fn() { static_scene_cache::toggle(); }
+
+	ConCommand xo_static_scene_rebuild_cmd{};
+	void xo_static_scene_rebuild_fn() { static_scene_cache::rebuild(); }
+
+	ConCommand xo_static_scene_status_cmd{};
+	void xo_static_scene_status_fn() { static_scene_cache::status(); }
+
+	ConCommand xo_static_scene_force_resident_cmd{};
+	void xo_static_scene_force_resident_fn() { static_scene_cache::force_resident(); }
+
+	ConCommand xo_sky3d_fusion_toggle_cmd{};
+	void xo_sky3d_fusion_toggle_fn() { static_scene_cache::toggle_sky3d_fusion(); }
+
+	ConCommand xo_static_scene_full_visibility_cmd{};
+	void xo_static_scene_full_visibility_fn() { static_scene_cache::toggle_full_visibility_capture(); }
+
+	ConCommand xo_static_scene_model_classifier_cmd{};
+	void xo_static_scene_model_classifier_fn() { static_scene_cache::toggle_model_info_classifier(); }
+
+	ConCommand xo_static_scene_install_pass_hook_cmd{};
+	void xo_static_scene_install_pass_hook_fn() { static_scene_cache::install_pass_hook_command(); }
+
+	ConCommand xo_static_scene_world_pass_bypass_cmd{};
+	void xo_static_scene_world_pass_bypass_fn() { static_scene_cache::toggle_world_pass_bypass(); }
+
+	ConCommand xo_static_scene_sky_pass_bypass_cmd{};
+	void xo_static_scene_sky_pass_bypass_fn() { static_scene_cache::toggle_sky_pass_bypass(); }
+
+	ConCommand xo_static_scene_validate_passes_cmd{};
+	void xo_static_scene_validate_passes_fn() { static_scene_cache::validate_world_passes(); }
+
+	ConCommand xo_static_scene_pass_status_cmd{};
+	void xo_static_scene_pass_status_fn() { static_scene_cache::world_pass_status(); }
+
+	ConCommand xo_static_scene_manifest_status_cmd{};
+	void xo_static_scene_manifest_status_fn() { static_scene_cache::manifest_status(); }
+
+	ConCommand xo_static_scene_manifest_save_cmd{};
+	void xo_static_scene_manifest_save_fn() { static_scene_cache::save_manifest(); }
+
+	ConCommand xo_static_scene_manifest_reload_cmd{};
+	void xo_static_scene_manifest_reload_fn() { static_scene_cache::reload_manifest(); }
+
+	ConCommand xo_static_scene_manifest_clear_cmd{};
+	void xo_static_scene_manifest_clear_fn() { static_scene_cache::clear_manifest(); }
+
+	ConCommand xo_static_scene_audit_export_cmd{};
+	void xo_static_scene_audit_export_fn() { static_scene_cache::export_audit_report(); }
+
+	ConCommand xo_static_scene_manifest_autosave_cmd{};
+	void xo_static_scene_manifest_autosave_fn()
+	{
+		const auto state = static_scene_cache::snapshot();
+		static_scene_cache::set_manifest_auto_save(!state.manifest_auto_save);
+		static_scene_cache::manifest_status();
+	}
+
+	ConCommand xo_static_scene_manifest_warmstart_cmd{};
+	void xo_static_scene_manifest_warmstart_fn()
+	{
+		const auto state = static_scene_cache::snapshot();
+		static_scene_cache::set_manifest_warm_start(!state.manifest_warm_start);
+		static_scene_cache::manifest_status();
+	}
+
+
+	ConCommand xo_wound_capture_once_cmd{};
+	void xo_wound_capture_once_fn()
+	{
+		wound_capture::capture_once();
+	}
+
+	ConCommand xo_world_ffp_toggle_cmd{};
+	void xo_world_ffp_toggle_fn()
+	{
+		world_ffp_bridge::g_enabled = !world_ffp_bridge::g_enabled;
+		world_ffp_bridge::print_status();
+	}
+
+	ConCommand xo_world_ffp_status_cmd{};
+	void xo_world_ffp_status_fn()
+	{
+		world_ffp_bridge::print_status();
+	}
+
+	ConCommand xo_material_source_hash_toggle_cmd{};
+	void xo_material_source_hash_toggle_fn()
+	{
+		material_exporter::m_inject_stable_hashes = !material_exporter::m_inject_stable_hashes;
+		world_ffp_bridge::print_status();
+	}
+
+	ConCommand xo_wound_capture_toggle_cmd{};
+	void xo_wound_capture_toggle_fn()
+	{
+		wound_capture::toggle_continuous();
+	}
+
+	ConCommand xo_wound_capture_clear_cmd{};
+	void xo_wound_capture_clear_fn()
+	{
+		wound_capture::clear_session();
+	}
+
+	ConCommand xo_wound_capture_status_cmd{};
+	void xo_wound_capture_status_fn()
+	{
+		wound_capture::print_status();
+	}
+
+	ConCommand xo_xorxor_water_status_cmd{};
+	void xo_xorxor_water_status_fn()
+	{
+		xorxor_water::print_status();
+	}
+
 	ConCommand xo_debug_toggle_model_info_cmd{};
 	void model_render::xo_debug_toggle_model_info_fn()
 	{
@@ -2053,6 +3266,9 @@ namespace components
 		tbl_hk::model_renderer::_interface = utils::module_interface.get<tbl_hk::model_renderer::IVModelRender*>("engine.dll", "VEngineModel016");
 		XASSERT(tbl_hk::model_renderer::table.init(tbl_hk::model_renderer::_interface) == false);
 		XASSERT(tbl_hk::model_renderer::table.hook(&tbl_hk::model_renderer::DrawModelExecute::Detour, tbl_hk::model_renderer::DrawModelExecute::index) == false);
+		// V20.2.3: DrawWorldLists is no longer detoured during module startup.
+		// Install it manually only after a map has loaded and visible-capture mode
+		// has been proven stable.
 
 		// init addon textures
 		init_texture_addons();
@@ -2074,29 +3290,64 @@ namespace components
 		HOOK_RETN_PLACE(RopeManager_DrawRenderCache_retn_addr, l4d2::hk_addr__rope_mgr_draw_render_cache + 6u);
 
 		// CGlowOverlay::Draw :: grab sun overlay color to apply color via TFACTOR instead of vertex colors (as that fails - search for "sprites/light_glow02_add_noz")
-		utils::hook::nop(l4d2::hk_addr__glow_overlay_draw, 8); // offs changed 0726
+		utils::hook::nop(l4d2::hk_addr__glow_overlay_draw, 8);
 		utils::hook(l4d2::hk_addr__glow_overlay_draw, grab_glowoverlay_color_stub, HOOK_JUMP).install()->quick();
 		HOOK_RETN_PLACE(grab_glowoverlay_color_retn_addr, l4d2::hk_addr__glow_overlay_draw + 8u);
 
 		// C_FuncAreaPortalWindow::DrawModel :: disable drawing Area Portal Brushmodels
-		utils::hook::nop(l4d2::nop_addr__func_area_portal_window_draw_mdl, 2);
+		utils::hook::nop(l4d2::nop_addr__func_area_portal_window_draw_mdl, 2); // 2501
 
 		// --
 		// Remove transforms from prop vertices (UNBAKE)
 		utils::hook::nop(l4d2::hk_addr__studio_draw_static_mesh, 7);
 		utils::hook(l4d2::hk_addr__studio_draw_static_mesh, unbake_transform::R_StudioDrawStaticMesh_stub, HOOK_JUMP).install()->quick();
-		HOOK_RETN_PLACE(unbake_transform::R_StudioDrawStaticMesh_og_retn_addr, l4d2::hk_addr__studio_draw_static_mesh + 7u); // 0xEF82
-		HOOK_RETN_PLACE(unbake_transform::R_StudioDrawStaticMesh_nop_retn_addr, l4d2::hk_addr__studio_draw_static_mesh + 9u); // 0xEF84
+		HOOK_RETN_PLACE(unbake_transform::R_StudioDrawStaticMesh_og_retn_addr, l4d2::hk_addr__studio_draw_static_mesh + 7u);
+		HOOK_RETN_PLACE(unbake_transform::R_StudioDrawStaticMesh_nop_retn_addr, l4d2::hk_addr__studio_draw_static_mesh + 9u);
 
 		// #
 		// commands
+
+		game::con_add_command(&xo_static_scene_experimental_unlock_cmd, "xo_static_scene_experimental_unlock", xo_static_scene_experimental_unlock_fn, "Unlock or lock experimental static-map baking for this process only");
+		game::con_add_command(&xo_static_scene_profile_safe_cmd, "xo_static_scene_profile_safe", xo_static_scene_profile_safe_fn, "Activate the Safe Preview static-map baking profile");
+		game::con_add_command(&xo_static_scene_profile_full_bsp_cmd, "xo_static_scene_profile_full_bsp", xo_static_scene_profile_full_bsp_fn, "Activate the Full BSP Capture experimental profile");
+		game::con_add_command(&xo_static_scene_profile_full_scene_cmd, "xo_static_scene_profile_full_scene", xo_static_scene_profile_full_scene_fn, "Activate the Full Scene Research profile with experimental static-prop classification");
+		game::con_add_command(&xo_static_scene_experimental_disable_cmd, "xo_static_scene_experimental_disable", xo_static_scene_experimental_disable_fn, "Disable static-map baking; resident scenes are cleared on map reload");
+		game::con_add_command(&xo_static_scene_experimental_reset_cmd, "xo_static_scene_experimental_reset", xo_static_scene_experimental_reset_fn, "Reset experimental static-map baking to disabled Safe Preview defaults");
+		game::con_add_command(&xo_static_scene_toggle_cmd, "xo_static_scene_toggle", xo_static_scene_toggle_fn, "Legacy toggle for acknowledged experimental static-map baking");
+		game::con_add_command(&xo_static_scene_rebuild_cmd, "xo_static_scene_rebuild", xo_static_scene_rebuild_fn, "Discard the current static scene signatures and capture the map again");
+		game::con_add_command(&xo_static_scene_status_cmd, "xo_static_scene_status", xo_static_scene_status_fn, "Print Full Resident Static Scene and Sky3D fusion counters");
+		game::con_add_command(&xo_static_scene_force_resident_cmd, "xo_static_scene_force_resident", xo_static_scene_force_resident_fn, "Immediately switch the current captured scene to resident replacement mode");
+		game::con_add_command(&xo_sky3d_fusion_toggle_cmd, "xo_sky3d_fusion_toggle", xo_sky3d_fusion_toggle_fn, "Toggle persistent 3D skybox fusion; rebuild the scene after changing it");
+		game::con_add_command(&xo_static_scene_full_visibility_cmd, "xo_static_scene_full_visibility", xo_static_scene_full_visibility_fn, "Toggle experimental all-BSP visframe capture; disabled by default");
+		game::con_add_command(&xo_static_scene_model_classifier_cmd, "xo_static_scene_model_classifier", xo_static_scene_model_classifier_fn, "Toggle experimental VModelInfo static-prop classifier; disabled by default");
+		game::con_add_command(&xo_static_scene_install_pass_hook_cmd, "xo_static_scene_install_pass_hook", xo_static_scene_install_pass_hook_fn, "Manually install the experimental IRender::DrawWorldLists hook");
+
+		game::con_add_command(&xo_static_scene_world_pass_bypass_cmd, "xo_static_scene_world_pass_bypass", xo_static_scene_world_pass_bypass_fn, "Toggle adaptive main-view DrawWorldLists bypass for covered resident passes");
+		game::con_add_command(&xo_static_scene_sky_pass_bypass_cmd, "xo_static_scene_sky_pass_bypass", xo_static_scene_sky_pass_bypass_fn, "Toggle adaptive VIEW_3DSKY DrawWorldLists bypass for covered resident passes");
+		game::con_add_command(&xo_static_scene_validate_passes_cmd, "xo_static_scene_validate_passes", xo_static_scene_validate_passes_fn, "Force covered world passes through one validation execution");
+		game::con_add_command(&xo_static_scene_pass_status_cmd, "xo_static_scene_pass_status", xo_static_scene_pass_status_fn, "Print adaptive DrawWorldLists coverage, validation and bypass statistics");
+		game::con_add_command(&xo_static_scene_manifest_status_cmd, "xo_static_scene_manifest_status", xo_static_scene_manifest_status_fn, "Print V20.8 per-map bake manifest and completeness status");
+		game::con_add_command(&xo_static_scene_manifest_save_cmd, "xo_static_scene_manifest_save", xo_static_scene_manifest_save_fn, "Save the current resident stable-signature manifest");
+		game::con_add_command(&xo_static_scene_manifest_reload_cmd, "xo_static_scene_manifest_reload", xo_static_scene_manifest_reload_fn, "Reload and validate the current map/profile bake manifest");
+		game::con_add_command(&xo_static_scene_manifest_clear_cmd, "xo_static_scene_manifest_clear", xo_static_scene_manifest_clear_fn, "Delete the current map/profile bake manifest");
+		game::con_add_command(&xo_static_scene_audit_export_cmd, "xo_static_scene_audit_export", xo_static_scene_audit_export_fn, "Export missing/new static-map signatures to a V20.8 audit report");
+		game::con_add_command(&xo_static_scene_manifest_autosave_cmd, "xo_static_scene_manifest_autosave", xo_static_scene_manifest_autosave_fn, "Toggle automatic manifest saves after Resident and clean map unload");
+		game::con_add_command(&xo_static_scene_manifest_warmstart_cmd, "xo_static_scene_manifest_warmstart", xo_static_scene_manifest_warmstart_fn, "Toggle validated-manifest warm-start confidence");
+
+		game::con_add_command(&xo_world_ffp_toggle_cmd, "xo_world_ffp_toggle", xo_world_ffp_toggle_fn, "Toggle full fixed-function conversion for LightmappedGeneric and WorldVertexTransition world draws");
+		game::con_add_command(&xo_world_ffp_status_cmd, "xo_world_ffp_status", xo_world_ffp_status_fn, "Print world fixed-function conversion and pass-capture counters");
+		game::con_add_command(&xo_material_source_hash_toggle_cmd, "xo_material_source_hash_toggle", xo_material_source_hash_toggle_fn, "Toggle Source VMT stable material hash injection; OFF preserves standard RTX Toolkit texture hashes");
+
+		game::con_add_command(&xo_wound_capture_once_cmd, "xo_wound_capture_once", xo_wound_capture_once_fn, "Capture the next original Source Infected draw before fixed-function conversion");
+		game::con_add_command(&xo_wound_capture_toggle_cmd, "xo_wound_capture_toggle", xo_wound_capture_toggle_fn, "Toggle rate-limited capture of unique original Source Infected payloads");
+		game::con_add_command(&xo_wound_capture_clear_cmd, "xo_wound_capture_clear", xo_wound_capture_clear_fn, "Clear in-memory wound capture signatures without deleting files");
+		game::con_add_command(&xo_wound_capture_status_cmd, "xo_wound_capture_status", xo_wound_capture_status_fn, "Print native L4D2 wound capture state and output directory");
+		game::con_add_command(&xo_xorxor_water_status_cmd, "xo_xorxor_water_status", xo_xorxor_water_status_fn, "Print Xorxor dual-layer water ownership, hash bypass and static-cache counters");
 
 		game::con_add_command(&xo_debug_toggle_model_info_cmd, "xo_debug_toggle_model_info", xo_debug_toggle_model_info_fn, "Toggle model name and radius visualizations");
 
 		game::con_add_command(&xo_debug_toggle_unbake_model_info_cmd, "xo_debug_toggle_unbake_model_info", xo_debug_toggle_unbake_model_info_fn, "Draw model name checksums for [UNBAKE] (mapsettings)");
 		game::con_add_command(&xo_mapsettings_get_unbake_info_cmd, "xo_mapsettings_get_unbake_info", xo_mapsettings_get_unbake_info_fn, "This log names of drawn models in the current frame to a logfile in portal2-rtx/logs/. Useful for MapSettings : [UNBAKE]");
-	
-		log("ModelRender", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
 	}
 }
 

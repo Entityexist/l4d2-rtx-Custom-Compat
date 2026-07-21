@@ -1,10 +1,4 @@
 #include "std_include.hpp"
-#include "remix_lights.hpp"
-
-#include "game_settings.hpp"
-#include "imgui.hpp"
-#include "interfaces.hpp"
-#include "remix_api.hpp"
 
 namespace components
 {
@@ -16,6 +10,314 @@ namespace components
 		bool show_mesh_bone_info = false;
 	}
 
+	namespace
+	{
+		bool light_group_matches_runtime_filter(const map_settings::remix_light_settings_s& def)
+		{
+			if (!remix_lights::runtime_group_filter_enabled()) {
+				return true;
+			}
+
+			const auto& filter = remix_lights::runtime_group_filter();
+			if (filter.empty()) {
+				return true;
+			}
+
+			return utils::str_to_lower(def.group) == utils::str_to_lower(filter);
+		}
+
+		bool light_is_runtime_enabled(const map_settings::remix_light_settings_s& def)
+		{
+			// V20.9 file-backed live-linked records are editor/database controllers.
+			// Their actual runtime light is owned by the Source entity tracker, so the
+			// ordinary map_settings spawn/event paths must not create a static duplicate.
+			if (def.persistent_map_light_from_file && def.generated_source_live_link) return false;
+			return def.enabled && light_group_matches_runtime_filter(def);
+		}
+
+		int apply_ies_cluster_quality_mode(const int authored_samples)
+		{
+			const int samples = std::clamp(authored_samples, 0, 24);
+			switch (std::clamp(remix_lights::ies_cluster_quality_mode(), 0, 4))
+			{
+			case 0: return 0;
+			case 1: return std::min(samples, 2);
+			case 2: return std::min(samples, std::max(1, (samples + 1) / 2));
+			case 4: return std::min(24, std::max(samples, samples + 2));
+			case 3:
+			default: return samples;
+			}
+		}
+
+
+		std::wstring utf8_to_wide_light_path(const std::string& value)
+		{
+			if (value.empty()) {
+				return {};
+			}
+
+			const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+			if (required <= 0)
+			{
+				// Source configuration files have historically been ANSI. Keep that fallback for old maps.
+				const int ansi_required = MultiByteToWideChar(CP_ACP, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+				if (ansi_required <= 0) return {};
+				std::wstring result(static_cast<size_t>(ansi_required), L'\0');
+				MultiByteToWideChar(CP_ACP, 0, value.c_str(), static_cast<int>(value.size()), result.data(), ansi_required);
+				return result;
+			}
+
+			std::wstring result(static_cast<size_t>(required), L'\0');
+			MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), result.data(), required);
+			return result;
+		}
+
+		std::filesystem::path light_game_root_path()
+		{
+			if (!game::root_path.empty()) {
+				return std::filesystem::path(game::root_path);
+			}
+
+			wchar_t executable[MAX_PATH] = {};
+			const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+			if (length == 0 || length >= MAX_PATH) return {};
+			return std::filesystem::path(executable).parent_path();
+		}
+
+		std::filesystem::path resolve_native_ies_profile_path(const std::string& authored_path)
+		{
+			const auto wide = utf8_to_wide_light_path(authored_path);
+			if (wide.empty()) return {};
+
+			std::filesystem::path input(wide);
+			if (!input.has_extension()) input += L".ies";
+
+			std::vector<std::filesystem::path> candidates;
+			if (input.is_absolute())
+			{
+				candidates.push_back(input);
+			}
+			else
+			{
+				const auto root = light_game_root_path();
+				candidates.push_back(root / L"rtx-remix" / L"ies" / input);
+				candidates.push_back(root / L"rtx-remix" / L"mods" / L"LegacyMaterials" / L"ies" / input);
+				candidates.push_back(root / input);
+			}
+
+			std::error_code ec;
+			for (auto candidate : candidates)
+			{
+				candidate = candidate.lexically_normal();
+				if (std::filesystem::is_regular_file(candidate, ec))
+				{
+					ec.clear();
+					auto canonical = std::filesystem::weakly_canonical(candidate, ec);
+					return ec ? candidate : canonical;
+				}
+				ec.clear();
+			}
+			return {};
+		}
+
+		const char* light_rig_mode_name(const int mode)
+		{
+			switch (mode)
+			{
+			case map_settings::remix_light_settings_s::LIGHT_RIG_MODE_NATIVE_IES: return "Native IES Profile Lights";
+			case map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES: return "Fake IES Profile Rig";
+			case map_settings::remix_light_settings_s::LIGHT_RIG_MODE_LEGACY:
+			default: return "Legacy Light Rig";
+			}
+		}
+
+		int resolved_runtime_light_shape(const map_settings::remix_light_settings_s::point_s& point)
+		{
+			if (point.authoring_shape != map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_AUTO) return point.authoring_shape;
+			return point.use_shaping
+				? map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_SPOT
+				: map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_POINT;
+		}
+
+		void build_analytical_light_basis(Vector direction, Vector& right, Vector& up)
+		{
+			if (direction.LengthSqr() <= 0.000001f) direction = Vector(0.0f, 0.0f, -1.0f);
+			direction.NormalizeChecked();
+			const Vector reference = std::fabs(direction.z) < 0.92f ? Vector(0.0f, 0.0f, 1.0f) : Vector(0.0f, 1.0f, 0.0f);
+			right = reference.Cross(direction);
+			if (right.LengthSqr() <= 0.000001f) right = Vector(1.0f, 0.0f, 0.0f);
+			right.NormalizeChecked();
+			up = direction.Cross(right);
+			if (up.LengthSqr() <= 0.000001f) up = Vector(0.0f, 1.0f, 0.0f);
+			up.NormalizeChecked();
+		}
+
+		void clear_analytical_light_chains(remix_lights::light* light)
+		{
+			if (!light) return;
+			light->m_ext.pNext = nullptr;
+			light->m_rect_ext.pNext = nullptr;
+			light->m_disk_ext.pNext = nullptr;
+			light->m_cylinder_ext.pNext = nullptr;
+			light->m_distant_ext.pNext = nullptr;
+		}
+
+		void* configure_analytical_light_geometry(remix_lights::light* light,
+			const map_settings::remix_light_settings_s::point_s* point)
+		{
+			if (!light || !point) return nullptr;
+			const void* ies_chain = point->light_rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_NATIVE_IES
+				? static_cast<const void*>(&light->m_native_ies_ext) : nullptr;
+			void* next = const_cast<void*>(ies_chain);
+			clear_analytical_light_chains(light);
+
+			Vector direction(light->m_ext.shaping_value.direction.x, light->m_ext.shaping_value.direction.y, light->m_ext.shaping_value.direction.z);
+			if (direction.LengthSqr() <= 0.000001f) direction = point->direction;
+			if (direction.LengthSqr() <= 0.000001f) direction = Vector(0.0f, 0.0f, -1.0f);
+			direction.NormalizeChecked();
+			Vector right, up;
+			build_analytical_light_basis(direction, right, up);
+
+			const int shape = resolved_runtime_light_shape(*point);
+			const float width = std::max(0.001f, point->authoring_width);
+			const float height = std::max(0.001f, point->authoring_height);
+			const float length = std::max(0.001f, point->authoring_length);
+			const bool pending_attachment = light->m_ext.radius <= 0.0f;
+
+			if (!pending_attachment && shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_RECT)
+			{
+				light->m_rect_ext = {};
+				light->m_rect_ext.sType = static_cast<remixapi_StructType>(10);
+				light->m_rect_ext.pNext = next;
+				light->m_rect_ext.position = light->m_ext.position;
+				light->m_rect_ext.xAxis = right.ToRemixFloat3D();
+				light->m_rect_ext.xSize = width;
+				light->m_rect_ext.yAxis = up.ToRemixFloat3D();
+				light->m_rect_ext.ySize = height;
+				light->m_rect_ext.direction = direction.ToRemixFloat3D();
+				light->m_rect_ext.shaping_hasvalue = light->m_ext.shaping_hasvalue ? 1u : 0u;
+				light->m_rect_ext.shaping_value = light->m_ext.shaping_value;
+				light->m_rect_ext.volumetricRadianceScale = light->m_ext.volumetricRadianceScale;
+				return &light->m_rect_ext;
+			}
+			if (!pending_attachment && shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_DISK)
+			{
+				light->m_disk_ext = {};
+				light->m_disk_ext.sType = static_cast<remixapi_StructType>(9);
+				light->m_disk_ext.pNext = next;
+				light->m_disk_ext.position = light->m_ext.position;
+				light->m_disk_ext.xAxis = right.ToRemixFloat3D();
+				light->m_disk_ext.xRadius = width * 0.5f;
+				light->m_disk_ext.yAxis = up.ToRemixFloat3D();
+				light->m_disk_ext.yRadius = height * 0.5f;
+				light->m_disk_ext.direction = direction.ToRemixFloat3D();
+				light->m_disk_ext.shaping_hasvalue = light->m_ext.shaping_hasvalue ? 1u : 0u;
+				light->m_disk_ext.shaping_value = light->m_ext.shaping_value;
+				light->m_disk_ext.volumetricRadianceScale = light->m_ext.volumetricRadianceScale;
+				return &light->m_disk_ext;
+			}
+			if (!pending_attachment && shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_TUBE)
+			{
+				light->m_cylinder_ext = {};
+				light->m_cylinder_ext.sType = static_cast<remixapi_StructType>(8);
+				light->m_cylinder_ext.pNext = next;
+				light->m_cylinder_ext.position = light->m_ext.position;
+				light->m_cylinder_ext.radius = width * 0.5f;
+				light->m_cylinder_ext.axis = direction.ToRemixFloat3D();
+				light->m_cylinder_ext.axisLength = length;
+				light->m_cylinder_ext.volumetricRadianceScale = light->m_ext.volumetricRadianceScale;
+				return &light->m_cylinder_ext;
+			}
+			if (!pending_attachment && shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_DISTANT)
+			{
+				light->m_distant_ext = {};
+				light->m_distant_ext.sType = static_cast<remixapi_StructType>(7);
+				light->m_distant_ext.pNext = next;
+				light->m_distant_ext.direction = direction.ToRemixFloat3D();
+				light->m_distant_ext.angularDiameterDegrees = std::clamp(width, 0.01f, 180.0f);
+				light->m_distant_ext.volumetricRadianceScale = light->m_ext.volumetricRadianceScale;
+				return &light->m_distant_ext;
+			}
+
+			light->m_ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			light->m_ext.pNext = next;
+			return &light->m_ext;
+		}
+
+		bool configure_light_backend(remix_lights::light* light,
+			const map_settings::remix_light_settings_s::point_s* point,
+			const remixapi_Float3D& current_direction)
+		{
+			if (!light || !point) return false;
+
+			clear_analytical_light_chains(light);
+			light->m_native_ies_ext = {};
+			light->m_native_ies_ext.sType = static_cast<remixapi_StructType>(28);
+			light->m_native_ies_status = light_rig_mode_name(point->light_rig_mode);
+
+			if (point->light_rig_mode != map_settings::remix_light_settings_s::LIGHT_RIG_MODE_NATIVE_IES)
+			{
+				light->m_native_ies_authored_path.clear();
+				light->m_native_ies_profile_path.clear();
+				light->m_native_ies_resolution_failed = false;
+				return true;
+			}
+
+			const int native_shape = resolved_runtime_light_shape(*point);
+			if (native_shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_TUBE ||
+				native_shape == map_settings::remix_light_settings_s::LIGHT_AUTHORING_SHAPE_DISTANT)
+			{
+				light->m_native_ies_status = "Native IES blocked: Tube and Distant geometry do not support photometric profiles";
+				return false;
+			}
+
+			// Resolve a profile only when the authored value changes. Animated lights are recreated every
+			// frame, so hitting exists()/canonical() on every CreateLight would turn IES into a filesystem
+			// polling path. DXVK's own IES cache/hot-reload remains responsible for content changes.
+			if (light->m_native_ies_authored_path != point->ies_file)
+			{
+				light->m_native_ies_authored_path = point->ies_file;
+				light->m_native_ies_profile_path.clear();
+				light->m_native_ies_resolution_failed = false;
+
+				const auto resolved = resolve_native_ies_profile_path(point->ies_file);
+				if (resolved.empty())
+				{
+					light->m_native_ies_resolution_failed = true;
+					light->m_native_ies_status = point->ies_file.empty()
+						? "Native IES blocked: no profile selected"
+						: "Native IES blocked: profile file not found";
+					return false;
+				}
+
+				light->m_native_ies_profile_path = resolved.wstring();
+			}
+
+			if (light->m_native_ies_resolution_failed || light->m_native_ies_profile_path.empty())
+			{
+				light->m_native_ies_status = point->ies_file.empty()
+					? "Native IES blocked: no profile selected"
+					: "Native IES blocked: profile file not found";
+				return false;
+			}
+
+			Vector direction(current_direction.x, current_direction.y, current_direction.z);
+			if (direction.LengthSqr() <= 0.000001f) direction = Vector(0.0f, 0.0f, -1.0f);
+			direction.NormalizeChecked();
+
+			light->m_native_ies_ext.pNext = nullptr;
+			light->m_native_ies_ext.profilePath = light->m_native_ies_profile_path.c_str();
+			light->m_native_ies_ext.direction = direction.ToRemixFloat3D();
+			light->m_native_ies_ext.axisRotationDegrees = std::clamp(point->ies_axis_rotation, -360.0f, 360.0f);
+			light->m_native_ies_ext.angleScale = std::clamp(point->ies_angle_scale, 0.01f, 8.0f);
+			light->m_native_ies_ext.intensityScale = std::clamp(point->ies_intensity_scale, 0.0f, 32.0f);
+			light->m_native_ies_ext.normalize = point->ies_normalize ? 1u : 0u;
+			light->m_native_ies_status = "Native IES ready: " + std::filesystem::path(light->m_native_ies_profile_path).filename().string();
+			return true;
+		}
+
+	}
+
 	/**
 	 * Initializes the light interpolator
 	 * @param points			Reference to point-list
@@ -25,7 +327,16 @@ namespace components
 	 */
 	bool remix_lights::light::interpolator::init(const std::vector<map_settings::remix_light_settings_s::point_s>& points, const bool looping, const bool loop_smoothing)
 	{
-		if (points.size() == 1) {
+		if (points.size() <= 1)
+		{
+			// A single point is a static light, not an animated mover.
+			// Reset the old state so Clear Animation actually disables the previous animation.
+			m_initialized = false;
+			m_points.clear();
+			m_segment_durations.clear();
+			m_looping = false;
+			m_loop_smoothing = false;
+			m_total_duration = 0.0f;
 			return false;
 		}
 
@@ -42,7 +353,8 @@ namespace components
 
 		if (points.size() > 1 && m_total_duration == 0.0f)
 		{
-			utils::log("RemixLights", "light_interpolator::init - Encountered a light were the last point has no defined timepoint! Placeholder in-use, please fix!", utils::LOG_TYPE::LOG_TYPE_WARN, true);
+			game::console();
+			std::cout << "[RemixLights][light_interpolator::init] Encountered a light were the last point has no defined timepoint! Placeholder in-use, please fix!" << std::endl;
 
 			// use timepoint of prev. point + 1.0
 			m_total_duration = (m_points)[m_points.size() - 2].timepoint + 1.0f;
@@ -335,6 +647,302 @@ namespace components
 
 	// ----
 
+	namespace
+	{
+		Vector normalize_or(Vector value, const Vector& fallback)
+		{
+			if (value.LengthSqr() <= 0.0001f) { value = fallback; }
+			if (value.LengthSqr() <= 0.0001f) { value = Vector(0.0f, 0.0f, -1.0f); }
+			value.NormalizeChecked();
+			return value;
+		}
+
+		void make_orthonormal_basis(const Vector& direction, Vector& right, Vector& up)
+		{
+			Vector dir = normalize_or(direction, Vector(0.0f, 0.0f, -1.0f));
+			up = Vector(0.0f, 0.0f, 1.0f);
+			if (std::fabs(dir.Dot(up)) > 0.96f) {
+				up = Vector(1.0f, 0.0f, 0.0f);
+			}
+
+			right = dir.Cross(up);
+			right.NormalizeChecked();
+			up = right.Cross(dir);
+			up.NormalizeChecked();
+		}
+
+		Vector calculate_ies_cluster_lateral_offset(const std::string& raw_pattern, const int index, const int samples, const float spread, const float aspect, const float twist_degrees, float* out_ring_weight = nullptr)
+		{
+			const float safe_samples = static_cast<float>(std::max(samples, 1));
+			const float t = (static_cast<float>(index) + 0.5f) / safe_samples;
+			const float golden_angle = 2.39996323f;
+			const float two_pi = 6.28318531f;
+			float ring = std::sqrt(std::clamp(t, 0.0f, 1.0f));
+			float x = 0.0f;
+			float y = 0.0f;
+
+			auto pattern = utils::str_to_lower(raw_pattern.empty() ? "spiral" : raw_pattern);
+			utils::replace_all(pattern, "-", "_");
+
+			if (pattern == "ring" || pattern == "donut")
+			{
+				const float angle = two_pi * static_cast<float>(index) / safe_samples;
+				x = std::cos(angle) * spread;
+				y = std::sin(angle) * spread;
+				ring = 1.0f;
+			}
+			else if (pattern == "line" || pattern == "tube")
+			{
+				const float denom = std::max(1.0f, safe_samples - 1.0f);
+				const float u = samples <= 1 ? 0.0f : (static_cast<float>(index) / denom) * 2.0f - 1.0f;
+				x = u * spread;
+				y = 0.0f;
+				ring = std::fabs(u);
+			}
+			else if (pattern == "cross" || pattern == "plus")
+			{
+				const int arm = index & 3;
+				const float arm_step = static_cast<float>(index / 4 + 1) / std::max(1.0f, std::ceil(safe_samples / 4.0f));
+				const float dist = std::clamp(arm_step, 0.0f, 1.0f) * spread;
+				x = (arm == 0 ? dist : arm == 1 ? -dist : 0.0f);
+				y = (arm == 2 ? dist : arm == 3 ? -dist : 0.0f);
+				ring = dist / std::max(0.001f, spread);
+			}
+			else if (pattern == "beam" || pattern == "hotspot")
+			{
+				const float angle = static_cast<float>(index) * golden_angle;
+				const float lateral = ring * spread;
+				x = std::cos(angle) * lateral * 0.45f;
+				y = std::sin(angle) * lateral;
+			}
+			else
+			{
+				const float angle = static_cast<float>(index) * golden_angle;
+				const float lateral = ring * spread;
+				x = std::cos(angle) * lateral;
+				y = std::sin(angle) * lateral;
+			}
+
+			y *= std::clamp(aspect, 0.1f, 8.0f);
+			const float twist = twist_degrees * 0.01745329252f;
+			const float rx = x * std::cos(twist) - y * std::sin(twist);
+			const float ry = x * std::sin(twist) + y * std::cos(twist);
+
+			if (out_ring_weight) {
+				*out_ring_weight = std::clamp(ring, 0.0f, 1.0f);
+			}
+			return Vector(rx, ry, 0.0f);
+		}
+	}
+
+	std::uint32_t remix_lights::get_ies_cluster_child_count() const
+	{
+		std::uint32_t count = 0u;
+		for (const auto& active_light : m_active_lights)
+		{
+			for (const auto& child : active_light.m_ies_children)
+			{
+				if (child.handle) {
+					++count;
+				}
+			}
+		}
+		return count;
+	}
+
+	remix_lights::runtime_debug_stats_s remix_lights::build_runtime_debug_stats() const
+	{
+		runtime_debug_stats_s stats = {};
+		stats.ies_budget_skipped = m_debug_ies_budget_skipped;
+		stats.native_ies_failures = m_debug_native_ies_failures;
+		stats.create_light_failures = m_debug_create_light_failures;
+
+		for (const auto& l : m_active_lights)
+		{
+			++stats.active_lights;
+			if (l.m_handle) { ++stats.spawned_handles; }
+			if (l.m_mover.is_initialized() || l.m_def.points.size() > 1u || (!l.m_def.animation.empty() && l.m_def.animation != "stable")) { ++stats.animated_lights; }
+			if (l.is_attached()) { ++stats.attached_lights; }
+			if (!l.m_handle && (l.has_spawn_trigger() || l.m_def.trigger_delay > 0.0f)) { ++stats.pending_trigger_lights; }
+			if (l.m_is_marked_for_destruction) { ++stats.marked_for_destroy; }
+			if (!light_group_matches_runtime_filter(l.m_def)) { ++stats.runtime_group_filtered; }
+
+			const int rig_mode = l.m_def.points.empty() ? map_settings::remix_light_settings_s::LIGHT_RIG_MODE_LEGACY : l.m_def.points.front().light_rig_mode;
+			if (rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_NATIVE_IES) ++stats.native_ies_lights;
+			else if (rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES) ++stats.fake_ies_rigs;
+			else ++stats.legacy_rig_lights;
+
+			for (const auto& child : l.m_ies_children)
+			{
+				if (child.handle) { ++stats.ies_child_handles; }
+			}
+		}
+
+		return stats;
+	}
+
+	void remix_lights::push_debug_lifecycle_event(std::string_view event, const light* l)
+	{
+		if (!m_debug_lifecycle_log_enabled) {
+			return;
+		}
+
+		auto frame_text = std::to_string(m_active_light_spawn_tracker);
+		if (frame_text.size() < 6u) {
+			frame_text.insert(frame_text.begin(), 6u - frame_text.size(), '0');
+		}
+
+		std::string line;
+		line.reserve(160u);
+		line += "[";
+		line += frame_text;
+		line += "] ";
+		line.append(event.data(), event.size());
+
+		if (l)
+		{
+			line += " | light=";
+			line += std::to_string(l->m_light_num);
+			line += " group=";
+			line += (l->m_def.group.empty() ? std::string("none") : l->m_def.group);
+			line += " comment=";
+			line += (l->m_def.comment.empty() ? std::string("none") : l->m_def.comment);
+			line += " pts=";
+			line += std::to_string(l->m_def.points.size());
+			line += " children=";
+			line += std::to_string(l->m_ies_children.size());
+		}
+
+		m_debug_lifecycle_log.push_front(std::move(line));
+		while (m_debug_lifecycle_log.size() > 96u) {
+			m_debug_lifecycle_log.pop_back();
+		}
+	}
+
+	void remix_lights::destroy_ies_emulation_lights(light* l)
+	{
+		if (!l) {
+			return;
+		}
+
+		if (!remix_api::is_initialized()) {
+			l->m_ies_children.clear();
+			return;
+		}
+
+		for (auto& child : l->m_ies_children)
+		{
+			if (child.handle)
+			{
+				remix_api::get()->m_bridge.DestroyLight(child.handle);
+				child.handle = nullptr;
+			}
+		}
+
+		l->m_ies_children.clear();
+	}
+
+	void remix_lights::update_ies_emulation_lights(light* l, const map_settings::remix_light_settings_s::point_s* control_point)
+	{
+		destroy_ies_emulation_lights(l);
+
+		if (!remix_api::is_initialized()) {
+			return;
+		}
+
+		if (!l || !control_point ||
+			control_point->light_rig_mode != map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES ||
+			!control_point->ies_emulation || control_point->ies_emulation_samples <= 0 || l->m_ext.radius <= 0.0f)
+		{
+			return;
+		}
+
+		const int requested_samples = apply_ies_cluster_quality_mode(control_point->ies_emulation_samples);
+		if (requested_samples <= 0) {
+			return;
+		}
+
+		int active_cluster_children = 0;
+		for (const auto& active_light : m_active_lights)
+		{
+			if (&active_light == static_cast<const light*>(l)) {
+				continue;
+			}
+			for (const auto& child : active_light.m_ies_children)
+			{
+				if (child.handle) {
+					++active_cluster_children;
+				}
+			}
+		}
+
+		const int helper_budget = std::clamp(m_ies_cluster_global_budget, 0, 512);
+		const int samples = std::min(requested_samples, std::max(0, helper_budget - active_cluster_children));
+		if (samples < requested_samples)
+		{
+			m_debug_ies_budget_skipped += static_cast<std::uint32_t>(requested_samples - std::max(samples, 0));
+			push_debug_lifecycle_event("ies budget skip", l);
+		}
+		if (samples <= 0) {
+			return;
+		}
+
+		Vector direction(l->m_ext.shaping_value.direction.x, l->m_ext.shaping_value.direction.y, l->m_ext.shaping_value.direction.z);
+		if (!l->m_ext.shaping_hasvalue || direction.LengthSqr() <= 0.0001f) {
+			direction = l->calculate_direction_for_point(control_point);
+		}
+		direction = normalize_or(direction, Vector(0.0f, 0.0f, -1.0f));
+
+		Vector right, up;
+		make_orthonormal_basis(direction, right, up);
+
+		const Vector base_pos(l->m_ext.position.x, l->m_ext.position.y, l->m_ext.position.z);
+		const Vector base_radiance(l->m_info.radiance.x, l->m_info.radiance.y, l->m_info.radiance.z);
+		const float base_radius = std::max(0.001f, l->m_ext.radius);
+		const float spread = std::max(0.0f, control_point->ies_emulation_spread) * base_radius;
+		const float radius_scale = std::clamp(control_point->ies_emulation_radius_scale, 0.01f, 4.0f);
+		const float intensity_scale = std::max(0.0f, control_point->ies_emulation_intensity_scale);
+		const float forward_offset = control_point->ies_emulation_forward_offset * base_radius;
+		const float aspect = std::clamp(control_point->ies_emulation_aspect, 0.1f, 8.0f);
+		const float twist = std::clamp(control_point->ies_emulation_twist, -360.0f, 360.0f);
+
+		l->m_ies_children.clear();
+		l->m_ies_children.resize(static_cast<size_t>(samples));
+
+		const auto api = remix_api::get();
+		for (int i = 0; i < samples; ++i)
+		{
+			const float sample_count = static_cast<float>(samples);
+			float ring = 0.0f;
+			const Vector local_offset = calculate_ies_cluster_lateral_offset(control_point->ies_emulation_pattern, i, samples, spread, aspect, twist, &ring);
+			const Vector offset = right * local_offset.x + up * local_offset.y + direction * forward_offset;
+			const float edge_weight = 0.65f + 0.35f * (1.0f - ring);
+
+			auto& child = l->m_ies_children[static_cast<size_t>(i)];
+			child.ext = {};
+			child.info = {};
+			child.ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			child.ext.pNext = nullptr;
+			child.ext.position = (base_pos + offset).ToRemixFloat3D();
+			child.ext.radius = base_radius * radius_scale * (0.85f + 0.15f * (1.0f - ring));
+			child.ext.shaping_hasvalue = l->m_ext.shaping_hasvalue;
+			child.ext.shaping_value = l->m_ext.shaping_value;
+			child.ext.volumetricRadianceScale = l->m_ext.volumetricRadianceScale * 0.65f;
+
+			child.info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+			child.info.pNext = &child.ext;
+			child.info.hash = utils::string_hash64(utils::va("api-light%d-ies-child%d", l->m_light_num, i));
+			child.info.radiance = (base_radiance * ((intensity_scale * edge_weight) / sample_count)).ToRemixFloat3D();
+
+			if (api->m_bridge.CreateLight(&child.info, &child.handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+			{
+				child.handle = nullptr;
+				++m_debug_create_light_failures;
+				push_debug_lifecycle_event("ies child CreateLight failed", l);
+			}
+		}
+	}
+
 	/**
 	 * Update a remixApi light using an "external" point
 	 * @param l			Light handle
@@ -343,13 +951,15 @@ namespace components
 	 */
 	bool remix_lights::update_static_remix_light(light* l, const map_settings::remix_light_settings_s::point_s* pt)
 	{
+		if (!remix_api::is_initialized()) {
+			return false;
+		}
+
 		if (!l || !pt) {
 			return false;
 		}
 
-		if (l->m_handle) {
-			destroy_map_light(l);
-		}
+		destroy_map_light(l);
 
 		if (l)
 		{
@@ -363,13 +973,35 @@ namespace components
 			l->m_ext.shaping_value.focusExponent = pt->exponent;
 			l->m_ext.volumetricRadianceScale = pt->volumetric_scale;
 
-			// not updating these can result in a crash in bridge::remix_api?
-			l->m_ext.pNext = nullptr;
+			// Configure exactly one rig backend. Native IES is chained to the selected compatible analytical geometry.
 			l->m_ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			if (!configure_light_backend(l, pt, l->m_ext.shaping_value.direction))
+			{
+				++m_debug_native_ies_failures;
+				push_debug_lifecycle_event("native IES configuration failed", l);
+				return false;
+			}
 			l->m_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-			l->m_info.pNext = &l->m_ext;
+			l->m_info.pNext = configure_analytical_light_geometry(l, pt);
+			if (!l->m_info.pNext) return false;
 
-			return remix_api::get()->m_bridge.CreateLight(&l->m_info, &l->m_handle) == REMIXAPI_ERROR_CODE_SUCCESS;
+			const auto api = remix_api::get();
+			if (!api || !remix_api::is_initialized()) {
+				return false;
+			}
+
+			const auto result = api->m_bridge.CreateLight(&l->m_info, &l->m_handle);
+			if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+				push_debug_lifecycle_event("static light updated", l);
+				if (pt->light_rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES) update_ies_emulation_lights(l, pt);
+				else destroy_ies_emulation_lights(l);
+			}
+			else
+			{
+				++m_debug_create_light_failures;
+				push_debug_lifecycle_event("static CreateLight failed", l);
+			}
+			return result == REMIXAPI_ERROR_CODE_SUCCESS;
 		}
 
 		return false;
@@ -382,13 +1014,15 @@ namespace components
 	 */
 	bool remix_lights::update_remix_light(light* l)
 	{
+		if (!remix_api::is_initialized()) {
+			return false;
+		}
+
 		if (!l || (l && !l->m_mover.is_initialized())) {
 			return false;
 		}
 
-		if (l->m_handle) {
-			destroy_map_light(l);
-		}
+		destroy_map_light(l);
 
 		if (l)
 		{
@@ -406,13 +1040,36 @@ namespace components
 
 			l->m_ext.shaping_hasvalue = l->m_ext.shaping_value.coneAngleDegrees != 180.0f;
 
-			// not updating these can result in a crash in bridge::remix_api?
-			l->m_ext.pNext = nullptr;
+			// The current interpolated direction also drives the native IES photometric axis.
 			l->m_ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			const auto* backend_point = l->m_def.points.empty() ? nullptr : &l->m_def.points.front();
+			if (!configure_light_backend(l, backend_point, l->m_ext.shaping_value.direction))
+			{
+				++m_debug_native_ies_failures;
+				push_debug_lifecycle_event("animated native IES configuration failed", l);
+				return false;
+			}
 			l->m_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-			l->m_info.pNext = &l->m_ext;
+			l->m_info.pNext = configure_analytical_light_geometry(l, backend_point);
+			if (!l->m_info.pNext) return false;
 
-			return remix_api::get()->m_bridge.CreateLight(&l->m_info, &l->m_handle) == REMIXAPI_ERROR_CODE_SUCCESS;
+			const auto api = remix_api::get();
+			if (!api || !remix_api::is_initialized()) {
+				return false;
+			}
+
+			const auto result = api->m_bridge.CreateLight(&l->m_info, &l->m_handle);
+			if (result == REMIXAPI_ERROR_CODE_SUCCESS && !l->m_def.points.empty()) {
+				push_debug_lifecycle_event("animated light updated", l);
+				if (l->m_def.points.front().light_rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES) update_ies_emulation_lights(l, &l->m_def.points.front());
+				else destroy_ies_emulation_lights(l);
+			}
+			else if (result != REMIXAPI_ERROR_CODE_SUCCESS)
+			{
+				++m_debug_create_light_failures;
+				push_debug_lifecycle_event("animated CreateLight failed", l);
+			}
+			return result == REMIXAPI_ERROR_CODE_SUCCESS;
 		}
 
 		return false;
@@ -425,13 +1082,17 @@ namespace components
 	 */
 	bool remix_lights::spawn_remix_light(light* l)
 	{
-		if (!l) {
+		if (!remix_api::is_initialized()) {
+			++m_debug_create_light_failures;
+			push_debug_lifecycle_event("spawn skipped: Remix API not initialized", l);
 			return false;
 		}
 
-		if (l->m_handle) {
-			destroy_map_light(l);
+		if (!l || l->m_def.points.empty()) {
+			return false;
 		}
+
+		destroy_map_light(l);
 
 		if (l)
 		{
@@ -449,13 +1110,36 @@ namespace components
 			l->m_ext.shaping_value.focusExponent = pt.exponent;
 			l->m_ext.volumetricRadianceScale = pt.volumetric_scale;
 
+			if (!configure_light_backend(l, &pt, l->m_ext.shaping_value.direction))
+			{
+				++m_debug_native_ies_failures;
+				push_debug_lifecycle_event("spawn native IES configuration failed", l);
+				return false;
+			}
+
 			l->m_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-			l->m_info.pNext = &l->m_ext;
+			l->m_info.pNext = configure_analytical_light_geometry(l, &pt);
+			if (!l->m_info.pNext) return false;
 			l->m_info.hash = utils::string_hash64(utils::va("api-light%d", l->m_light_num));
 			l->m_info.radiance = (pt.radiance * pt.radiance_scalar).ToRemixFloat3D();
 
 			const auto api = remix_api::get();
-			return api->m_bridge.CreateLight(&l->m_info, &l->m_handle) == REMIXAPI_ERROR_CODE_SUCCESS;
+			if (!api || !remix_api::is_initialized()) {
+				return false;
+			}
+
+			const auto result = api->m_bridge.CreateLight(&l->m_info, &l->m_handle);
+			if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+				push_debug_lifecycle_event("light spawned", l);
+				if (pt.light_rig_mode == map_settings::remix_light_settings_s::LIGHT_RIG_MODE_FAKE_IES) update_ies_emulation_lights(l, &pt);
+				else destroy_ies_emulation_lights(l);
+			}
+			else
+			{
+				++m_debug_create_light_failures;
+				push_debug_lifecycle_event("spawn CreateLight failed", l);
+			}
+			return result == REMIXAPI_ERROR_CODE_SUCCESS;
 		}
 
 		return false;
@@ -472,6 +1156,11 @@ namespace components
 		auto& msettings = map_settings::get_map_settings();
 		for (auto it = msettings.remix_lights.begin(); it != msettings.remix_lights.end();)
 		{
+			if (!light_is_runtime_enabled(*it)) {
+				++it;
+				continue;
+			}
+
 			if (it->trigger_choreo_name.empty() && !it->trigger_sound_hash) // add lights without a trigger
 			{
 				m_active_lights.emplace_back(
@@ -522,6 +1211,19 @@ namespace components
 	 */
 	void remix_lights::add_single_map_setting_light(map_settings::remix_light_settings_s* def)
 	{
+		add_single_map_setting_light_report(def);
+	}
+
+	bool remix_lights::add_single_map_setting_light_report(map_settings::remix_light_settings_s* def)
+	{
+		if (!def) {
+			return false;
+		}
+
+		if (!imgui::get()->m_light_edit_mode && !light_is_runtime_enabled(*def)) {
+			return false;
+		}
+
 		m_active_lights.emplace_back(
 			light{
 				.m_def = *def, // do not move the light if it can be triggered multiple times
@@ -537,8 +1239,172 @@ namespace components
 			}
 
 			// spawn it
-			get()->spawn_remix_light(light);
+			return get()->spawn_remix_light(light);
 		}
+
+		return true;
+	}
+
+
+	void remix_lights::destroy_source_distant_light()
+	{
+		if (m_source_distant_handle && remix_api::is_initialized())
+		{
+			if (auto* api = remix_api::get()) {
+				api->m_bridge.DestroyLight(m_source_distant_handle);
+			}
+		}
+		if (const auto dev = game::get_d3d_device()) {
+			dev->LightEnable(static_cast<DWORD>(std::clamp(m_source_directional_ff_index, 0, 7)), FALSE);
+		}
+		m_source_distant_handle = nullptr;
+		m_source_distant_info = {};
+		m_source_distant_ext = {};
+		m_source_distant_ext.sType = static_cast<remixapi_StructType>(7);
+		m_source_distant_last_error = REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		m_source_distant_hash = 0u;
+		m_source_distant_draw_calls = 0u;
+		m_source_directional_ff_direction = Vector(0.0f, 0.0f, -1.0f);
+		m_source_directional_ff_radiance = Vector(0.0f, 0.0f, 0.0f);
+		m_source_directional_ff_active = false;
+		m_source_directional_ff_draw_calls = 0u;
+		m_source_distant_runtime_status = "Source environment light cleared";
+	}
+
+	bool remix_lights::upsert_source_distant_light(const std::uint64_t stable_hash, Vector direction,
+		const Vector& radiance, const float angular_diameter_degrees, const float volumetric_scale)
+	{
+		if (direction.LengthSqr() <= 0.000001f || !std::isfinite(direction.x) ||
+			!std::isfinite(direction.y) || !std::isfinite(direction.z))
+		{
+			m_source_distant_runtime_status = "Source environment blocked: invalid direction";
+			return false;
+		}
+		direction.NormalizeChecked();
+
+		Vector safe_radiance = radiance;
+		if (!std::isfinite(safe_radiance.x)) safe_radiance.x = 0.0f;
+		if (!std::isfinite(safe_radiance.y)) safe_radiance.y = 0.0f;
+		if (!std::isfinite(safe_radiance.z)) safe_radiance.z = 0.0f;
+		safe_radiance.x = std::max(0.0f, safe_radiance.x);
+		safe_radiance.y = std::max(0.0f, safe_radiance.y);
+		safe_radiance.z = std::max(0.0f, safe_radiance.z);
+		if (std::max({ safe_radiance.x, safe_radiance.y, safe_radiance.z }) <= 0.000001f)
+		{
+			m_source_distant_runtime_status = "Source environment blocked: zero radiance";
+			return false;
+		}
+
+		// Keep the Source-global light state independently of the native API result.
+		// This gives the ASI a second translation path through D3D9 DIRECTIONAL state.
+		destroy_source_distant_light();
+		m_source_distant_hash = stable_hash != 0u ? stable_hash : 0x534F555243455355ull; // "SOURCESU"
+		m_source_directional_ff_direction = direction;
+		m_source_directional_ff_radiance = safe_radiance;
+		m_source_directional_ff_active = true;
+
+		if (!remix_api::is_initialized() || !remix_api::get())
+		{
+			m_source_distant_last_error = REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+			m_source_distant_runtime_status = m_source_directional_ff_enabled
+				? "native Distant unavailable; D3D9 directional fallback armed"
+				: "Source environment stored, but native API unavailable and FF fallback disabled";
+			return m_source_directional_ff_enabled;
+		}
+
+		// The paired Remix bridge already serializes Distant as analytical light sType 7.
+		// Keep the exact public C layout and verify it at compile time in the header.
+		m_source_distant_ext = {};
+		m_source_distant_ext.sType = static_cast<remixapi_StructType>(7);
+		m_source_distant_ext.pNext = nullptr;
+		m_source_distant_ext.direction = direction.ToRemixFloat3D();
+		m_source_distant_ext.angularDiameterDegrees = std::clamp(
+			std::isfinite(angular_diameter_degrees) ? angular_diameter_degrees : 0.53f, 0.01f, 180.0f);
+		m_source_distant_ext.volumetricRadianceScale = std::max(0.0f,
+			std::isfinite(volumetric_scale) ? volumetric_scale : 1.0f);
+
+		m_source_distant_info = {};
+		m_source_distant_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+		m_source_distant_info.pNext = &m_source_distant_ext;
+		m_source_distant_info.hash = m_source_distant_hash;
+		m_source_distant_info.radiance = safe_radiance.ToRemixFloat3D();
+
+		auto* api = remix_api::get();
+		m_source_distant_last_error = api->m_bridge.CreateLight(&m_source_distant_info, &m_source_distant_handle);
+		if (m_source_distant_last_error != REMIXAPI_ERROR_CODE_SUCCESS)
+		{
+			m_source_distant_handle = nullptr;
+			m_source_distant_runtime_status = std::format(
+				"native Distant failed code {} sType 7 size {}; FF directional {} | hash 0x{:016X}",
+				static_cast<int>(m_source_distant_last_error), sizeof(m_source_distant_ext),
+				m_source_directional_ff_enabled ? "armed" : "disabled", m_source_distant_hash);
+			++m_debug_create_light_failures;
+			return m_source_directional_ff_enabled;
+		}
+
+		m_source_distant_runtime_status = std::format(
+			"native Distant active + FF {} | hash 0x{:016X} | dir {:.4f} {:.4f} {:.4f} | diameter {:.3f} | radiance {:.3f} {:.3f} {:.3f}",
+			m_source_directional_ff_enabled ? "armed" : "off", m_source_distant_hash,
+			direction.x, direction.y, direction.z, m_source_distant_ext.angularDiameterDegrees,
+			safe_radiance.x, safe_radiance.y, safe_radiance.z);
+		return true;
+	}
+
+	bool remix_lights::has_light_with_exact_comment(const std::string_view comment) const
+	{
+		if (comment.empty()) {
+			return false;
+		}
+
+		return std::any_of(m_active_lights.begin(), m_active_lights.end(), [&](const light& entry)
+		{
+			return entry.m_def.comment == comment;
+		});
+	}
+
+	bool remix_lights::upsert_runtime_light(const map_settings::remix_light_settings_s& def, const bool enabled)
+	{
+		if (def.comment.empty()) {
+			return false;
+		}
+
+		auto it = std::find_if(m_active_lights.begin(), m_active_lights.end(), [&](const light& entry)
+		{
+			return entry.m_def.comment == def.comment;
+		});
+
+		if (!enabled)
+		{
+			if (it != m_active_lights.end())
+			{
+				destroy_map_light(&*it);
+				m_active_lights.erase(it);
+			}
+			return true;
+		}
+
+		if (def.points.empty()) {
+			return false;
+		}
+
+		if (it == m_active_lights.end())
+		{
+			auto copy = def;
+			return add_single_map_setting_light_report(&copy);
+		}
+
+		it->m_def = def;
+		it->m_is_marked_for_destruction = false;
+		it->m_timer = def.kill_delay;
+
+		if (def.points.size() > 1u)
+		{
+			it->m_mover = light::interpolator{};
+			it->m_mover.init(def.points, def.loop, def.loop_smoothing);
+			return spawn_remix_light(&*it);
+		}
+
+		return update_static_remix_light(&*it, &def.points.front());
 	}
 
 	/**
@@ -547,10 +1413,46 @@ namespace components
 	 */
 	void remix_lights::destroy_map_light(light* l)
 	{
+		if (!l) {
+			return;
+		}
+
+		if (!remix_api::is_initialized()) {
+			l->m_handle = nullptr;
+			l->m_ies_children.clear();
+			return;
+		}
+
+		if (l->m_handle || !l->m_ies_children.empty()) {
+			push_debug_lifecycle_event("destroy light", l);
+		}
+
+		destroy_ies_emulation_lights(l);
+
 		if (l->m_handle)
 		{
 			remix_api::get()->m_bridge.DestroyLight(l->m_handle);
 			l->m_handle = nullptr;
+		}
+	}
+
+	void remix_lights::destroy_lights_with_comment_prefix(std::string_view prefix)
+	{
+		if (prefix.empty()) {
+			return;
+		}
+
+		for (auto it = m_active_lights.begin(); it != m_active_lights.end();)
+		{
+			if (it->m_def.comment.starts_with(prefix))
+			{
+				destroy_map_light(&*it);
+				it = m_active_lights.erase(it);
+			}
+			else
+			{
+				++it;
+			}
 		}
 	}
 
@@ -569,6 +1471,7 @@ namespace components
 	 */
 	void remix_lights::destroy_and_clear_all_active_lights()
 	{
+		destroy_source_distant_light();
 		destroy_all_map_lights();
 		m_active_lights.clear();
 	}
@@ -656,13 +1559,163 @@ namespace components
 		}
 	}
 
+	// Mirrors current active Remix lights into the old D3D9 fixed-function light table.
+	// This does not replace the Remix API light path. It is a compatibility probe/backend for
+	// experiments where Remix/bridge might understand FF SetLight state better than custom API lights.
+	void remix_lights::emit_ff_setlight_mirror_for_active_lights()
+	{
+		m_ff_setlight_emitted = 0u;
+		m_ff_setlight_failed = 0u;
+
+		if (!m_ff_setlight_mirror_enabled) {
+			return;
+		}
+
+		const auto dev = game::get_d3d_device();
+		if (!dev) {
+			++m_ff_setlight_failed;
+			return;
+		}
+
+		const int start_index = std::clamp(m_ff_setlight_start_index, 0, 7);
+		const int max_lights = std::clamp(m_ff_setlight_max_lights, 0, 8 - start_index);
+		const float scalar = std::max(0.0f, m_ff_setlight_scalar);
+		const float radius_scale = std::max(0.001f, m_ff_setlight_radius_scale);
+
+		int emitted = 0;
+		for (const auto& light : m_active_lights)
+		{
+			if (!light_group_matches_runtime_filter(light.m_def)) {
+				continue;
+			}
+
+			if (emitted >= max_lights) {
+				break;
+			}
+
+			if (m_ff_setlight_mirror_only_visible && !light.m_handle) {
+				continue;
+			}
+
+			D3DLIGHT9 d3d = {};
+			d3d.Type = light.m_ext.shaping_hasvalue ? D3DLIGHT_SPOT : D3DLIGHT_POINT;
+			d3d.Diffuse.r = std::max(0.0f, light.m_info.radiance.x * scalar);
+			d3d.Diffuse.g = std::max(0.0f, light.m_info.radiance.y * scalar);
+			d3d.Diffuse.b = std::max(0.0f, light.m_info.radiance.z * scalar);
+			d3d.Diffuse.a = 1.0f;
+			d3d.Specular = d3d.Diffuse;
+			d3d.Ambient.r = d3d.Ambient.g = d3d.Ambient.b = 0.0f;
+			d3d.Ambient.a = 1.0f;
+			d3d.Position.x = light.m_ext.position.x;
+			d3d.Position.y = light.m_ext.position.y;
+			d3d.Position.z = light.m_ext.position.z;
+
+			const float range = std::max(0.05f, light.m_ext.radius * radius_scale);
+			d3d.Range = range;
+			d3d.Attenuation0 = 0.0f;
+			d3d.Attenuation1 = 1.0f / range;
+			d3d.Attenuation2 = 0.0f;
+
+			if (d3d.Type == D3DLIGHT_SPOT)
+			{
+				Vector dir(light.m_ext.shaping_value.direction.x, light.m_ext.shaping_value.direction.y, light.m_ext.shaping_value.direction.z);
+				if (dir.LengthSqr() <= 0.0001f) {
+					dir = Vector(0.0f, 1.0f, 0.0f);
+				}
+				dir.Normalize();
+				d3d.Direction.x = dir.x;
+				d3d.Direction.y = dir.y;
+				d3d.Direction.z = dir.z;
+
+				const float phi = std::clamp(light.m_ext.shaping_value.coneAngleDegrees, 1.0f, 179.0f) * static_cast<float>(M_PI / 180.0);
+				const float softness = std::clamp(light.m_ext.shaping_value.coneSoftness, 0.0f, 1.0f);
+				d3d.Phi = phi;
+				d3d.Theta = std::max(0.001f, phi * (0.55f + 0.35f * (1.0f - softness)));
+				d3d.Falloff = std::max(0.001f, 1.0f + light.m_ext.shaping_value.focusExponent);
+			}
+
+			const DWORD index = static_cast<DWORD>(start_index + emitted);
+			if (SUCCEEDED(dev->SetLight(index, &d3d)) && SUCCEEDED(dev->LightEnable(index, TRUE))) {
+				++emitted;
+				++m_ff_setlight_emitted;
+			}
+			else {
+				++m_ff_setlight_failed;
+			}
+		}
+
+		// Disable leftover mirror slots so stale FF lights do not stay active after a light budget drop.
+		for (int i = emitted; i < max_lights; ++i) {
+			dev->LightEnable(static_cast<DWORD>(start_index + i), FALSE);
+		}
+	}
+
+	void remix_lights::emit_source_directional_ff_fallback()
+	{
+		if (!m_source_directional_ff_active || !m_source_directional_ff_enabled) return;
+		const auto dev = game::get_d3d_device();
+		if (!dev) return;
+
+		Vector direction = m_source_directional_ff_direction;
+		if (direction.LengthSqr() <= 0.000001f) return;
+		direction.NormalizeChecked();
+		const float peak = std::max({ m_source_directional_ff_radiance.x,
+			m_source_directional_ff_radiance.y, m_source_directional_ff_radiance.z, 0.000001f });
+		const float scale = std::max(0.0f, m_source_directional_ff_scalar);
+
+		D3DLIGHT9 light = {};
+		light.Type = D3DLIGHT_DIRECTIONAL;
+		light.Direction.x = direction.x;
+		light.Direction.y = direction.y;
+		light.Direction.z = direction.z;
+		light.Diffuse.r = std::clamp(m_source_directional_ff_radiance.x / peak * scale, 0.0f, 1.0f);
+		light.Diffuse.g = std::clamp(m_source_directional_ff_radiance.y / peak * scale, 0.0f, 1.0f);
+		light.Diffuse.b = std::clamp(m_source_directional_ff_radiance.z / peak * scale, 0.0f, 1.0f);
+		light.Diffuse.a = 1.0f;
+		light.Specular = light.Diffuse;
+		light.Ambient.a = 1.0f;
+
+		const DWORD index = static_cast<DWORD>(std::clamp(m_source_directional_ff_index, 0, 7));
+		if (SUCCEEDED(dev->SetLight(index, &light)) && SUCCEEDED(dev->LightEnable(index, TRUE))) {
+			++m_source_directional_ff_draw_calls;
+		}
+	}
+
 	// Draw all active map lights
 	void remix_lights::draw_all_active_lights()
 	{
+		emit_ff_setlight_mirror_for_active_lights();
+		emit_source_directional_ff_fallback();
+
+		if (!remix_api::is_initialized()) {
+			return;
+		}
+
+		// CreateLight only allocates the native light. Remix requires each active handle
+		// to be submitted every frame with DrawLightInstance. The old generic path did
+		// this through m_active_lights; the dedicated Source sun must do it explicitly.
+		if (m_source_distant_handle)
+		{
+			remix_api::get()->m_bridge.DrawLightInstance(m_source_distant_handle);
+			++m_source_distant_draw_calls;
+		}
+
+		const bool edit_mode = imgui::get()->m_light_edit_mode;
 		for (auto& l : m_active_lights)
 		{
+			if (!edit_mode && !light_group_matches_runtime_filter(l.m_def)) {
+				continue;
+			}
+
 			if (l.m_handle) {
 				remix_api::get()->m_bridge.DrawLightInstance(l.m_handle);
+			}
+
+			for (auto& child : l.m_ies_children)
+			{
+				if (child.handle) {
+					remix_api::get()->m_bridge.DrawLightInstance(child.handle);
+				}
 			}
 		}
 	}
@@ -861,6 +1914,11 @@ namespace components
 		auto& msettings = map_settings::get_map_settings();
 		for (auto it = msettings.remix_lights.begin(); it != msettings.remix_lights.end();)
 		{
+			if (!light_is_runtime_enabled(*it)) {
+				++it;
+				continue;
+			}
+
 			if (!it->trigger_choreo_name.empty() && name.contains(it->trigger_choreo_name))
 			{
 				// check if opt. actor is defined and matches event actor
@@ -933,6 +1991,11 @@ namespace components
 		auto& msettings = map_settings::get_map_settings();
 		for (auto it = msettings.remix_lights.begin(); it != msettings.remix_lights.end();)
 		{
+			if (!light_is_runtime_enabled(*it)) {
+				++it;
+				continue;
+			}
+
 			if (it->trigger_sound_hash == hash)
 			{
 				get()->add_single_map_setting_light(&*it);
@@ -950,12 +2013,15 @@ namespace components
 	void remix_lights::on_client_frame()
 	{
 		const auto rml = remix_lights::get();
+		if (!rml) {
+			return;
+		}
 		const auto& glob = interfaces::get()->m_globals;
 
 		// check if paused
 		rml->m_is_paused = utils::float_equal(glob->frametime, 0.0f);
 
-		if (!rml->m_is_paused) 
+		if (!rml->m_is_paused && remix_api::is_initialized()) 
 		{
 			rml->update_all_active_lights();
 			rml->debug_print_player_pos_time();
@@ -965,7 +2031,7 @@ namespace components
 
 		rml->draw_all_active_lights();
 
-		if (cmd::show_api_lights)
+		if (cmd::show_api_lights && remix_api::is_initialized())
 		{
 			bool first_done = false;
 			for (const auto& l : m_active_lights)
@@ -996,9 +2062,17 @@ namespace components
 	// called before map_settings
 	void remix_lights::on_map_load()
 	{
+		if (auto* lights = get()) {
+			lights->destroy_source_distant_light();
+		}
+
 		// reset spawn tracker
 		m_active_light_spawn_tracker = 0u;
 		m_attachframe_counter = 0u;
+		m_debug_create_light_failures = 0u;
+		m_debug_native_ies_failures = 0u;
+		m_debug_ies_budget_skipped = 0u;
+		m_debug_lifecycle_log.clear();
 	}
 
 	void remix_lights::debug_print_player_pos_time()
@@ -1098,8 +2172,5 @@ namespace components
 		game::con_add_command(&xo_debug_toggle_show_api_lights_cmd, "xo_debug_toggle_show_api_lights", xo_debug_toggle_show_api_lights_fn, "Toggle debug vis for lights added via the remixapi");
 		game::con_add_command(&xo_debug_show_mesh_bone_info_attached_cmd, "xo_debug_show_mesh_bone_info_attached", xo_debug_show_mesh_bone_info_attached_fn, "Edit Mode + Attached to mesh only: Show bone information of mesh with an attached remixApi light (names/indices)");
 		game::con_add_command(&xo_debug_show_mesh_bone_info_cmd, "xo_debug_show_mesh_bone_info", xo_debug_show_mesh_bone_info_fn, "Show bone information for all nearby meshes (names/indices + entity indices)");
-
-		m_initialized = true;
-		log("RemixLights", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
 	}
 }

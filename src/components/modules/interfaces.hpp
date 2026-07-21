@@ -2,7 +2,7 @@
 
 namespace components
 {
-	class interfaces final : public loader::component_module
+	class interfaces : public component
 	{
 	public:
 		interfaces();
@@ -10,26 +10,20 @@ namespace components
 		static inline interfaces* p_this = nullptr;
 		static interfaces* get() { return p_this; }
 
-		static bool is_initialized()
-		{
-			if (const auto mod = get(); mod && mod->m_initialized) {
-				return true;
-			}
-			return false;
-		}
-
 		sdk::base_client* m_client = nullptr;
 		sdk::engine_client* m_engine = nullptr;
+		sdk::engine_effects* m_effects = nullptr;
+		sdk::engine_trace* m_engine_trace = nullptr;
 		sdk::entity_list* m_entity_list = nullptr;
-		sdk::player_info_manager* m_player_manager = nullptr;
 		sdk::surface* m_surface = nullptr;
+		sdk::player_info_manager* m_player_manager = nullptr;
+		IVModelInfo* m_model_info = nullptr;
 		sdk::CCvar* m_cvar = nullptr;
+		void* m_server_tools = nullptr;
 		CGlobalVarsBase* m_globals = nullptr;
 
 private:
 		template <typename m_interface>
 		static m_interface* get_interface(const std::string& module_name, const std::string& interface_name);
-
-		bool m_initialized = false;
 	};
 }

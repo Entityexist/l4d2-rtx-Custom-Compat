@@ -705,14 +705,17 @@ namespace utils::vector
 
 	inline void AngleVectors(const Vector& angles, Vector* forward)
 	{
+		// Source QAngle order is pitch, yaw, roll. The previous implementation mixed
+		// the sine/cosine outputs for pitch and yaw, rotating projected/spot lights
+		// onto the wrong axis (commonly appearing as a 90-degree offset).
 		float sp, sy, cp, cy;
-		sin_cos(DEG2RADF(angles[YAW]), sp, cp);
-		sin_cos(DEG2RADF(angles[PITCH]), sy, cy);
+		sin_cos(DEG2RADF(angles[PITCH]), sp, cp);
+		sin_cos(DEG2RADF(angles[YAW]), sy, cy);
 
 		if (forward)
 		{
-			forward->x = (cp * cy);
-			forward->y = (cp * sy);
+			forward->x = cp * cy;
+			forward->y = cp * sy;
 			forward->z = -sp;
 		}
 	}

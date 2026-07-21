@@ -8,15 +8,11 @@
 #define COMPMOD_ASSET_DIR "l4d2-rtx\\"
 #define WINDOW_TITLE_STR "Left 4 Dead 2 - Direct3D 9"
 
-constexpr auto COMP_MOD_VERSION_MAJOR = 1;
-constexpr auto COMP_MOD_VERSION_MINOR = 2;
-constexpr auto COMP_MOD_VERSION_PATCH = 0;
-
-// adjust for pre-release builds
-constexpr auto COMP_MOD_PRE_RELEASE_NUM = 0;
-
 // enable/disable benchmark logic
 //#define BENCHMARK
+
+// Version number
+#include <version.hpp>
 
 #define NOMINMAX
 #include <windows.h>
@@ -24,19 +20,37 @@ constexpr auto COMP_MOD_PRE_RELEASE_NUM = 0;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string_view>
+#include <cwctype>
+#include <cctype>
 #include <shellapi.h>
 #include <chrono>
 #include <mutex>
+#include <shared_mutex>
+#include <atomic>
 #include <filesystem>
 #include <cassert>
 #include <map>
 #include <set>
+#include <vector>
+#include <deque>
 #include <unordered_set>
+#include <unordered_map>
 #include <fstream>
 #include <iostream>
 #include <xmmintrin.h>
 #include <intrin.h>
 #include <numbers>
+#include <algorithm>
+#include <format>
+#include <cfloat>
+#include <cstdint>
+#include <cmath>
+#include <initializer_list>
+#include <limits>
+#include <array>
+#include <sstream>
+#include <iomanip>
 
 #pragma warning(push)
 #pragma warning(disable: 26495)
@@ -46,6 +60,9 @@ constexpr auto COMP_MOD_PRE_RELEASE_NUM = 0;
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define STRINGIZE_(x) #x
 #define STRINGIZE(x) STRINGIZE_(x)
@@ -55,8 +72,13 @@ constexpr auto COMP_MOD_PRE_RELEASE_NUM = 0;
 #define XASSERT(x) if (x) MessageBoxA(HWND_DESKTOP, #x, "FATAL ERROR", MB_ICONERROR)
 
 #include "MinHook.h"
+
+// toml11 is third-party code. Keep MSVC Code Analysis diagnostics from the
+// dependency out of the project warning list without modifying vendor files.
+#pragma warning(push)
+#pragma warning(disable: 26439 26478 26495 26498)
 #include "toml.hpp"
-#include "bridge_remix_api.h"
+#pragma warning(pop)
 
 #pragma warning(push)
 #pragma warning(disable: 6011)
@@ -68,30 +90,33 @@ constexpr auto COMP_MOD_PRE_RELEASE_NUM = 0;
 #include <misc/cpp/imgui_stdlib.h>
 #pragma warning(pop)
 
-#include "game/globals.hpp"
+#include "bridge_remix_api.h"
+
 #include "game/structs.hpp"
 #include "utils/fnv.hpp"
 #include "utils/utils.hpp"
 #include "utils/vector.hpp"
-#include "utils/console.hpp"
-#include "utils/flags.hpp"
-#include "utils/hooking.hpp"
-#include "utils/function.hpp"
-#include "utils/memory.hpp"
-
-#include "components/loader.hpp"
-#include "game/functions.hpp"
-#include "game/l4d2.hpp"
-#include "components/common/toml_ext.hpp"
 
 #include "sdk/netvar/netvar.hpp"
 #include "sdk/client/c_base_client.hpp"
 #include "sdk/client/c_player_info_manager.hpp"
 #include "sdk/engine/c_engine_client.hpp"
+#include "sdk/engine/c_engine_effects.hpp"
+#include "sdk/engine/c_engine_trace.hpp"
 #include "sdk/client/c_collideable.hpp"
 #include "sdk/entity/c_base_entity.hpp"
 #include "sdk/entity/c_entity_list.hpp"
 #include "sdk/vgui/surface/c_surface_mgr.hpp"
 #include "sdk/cvar/cvar.hpp"
+
+#include "utils/hooking.hpp"
+#include "utils/memory.hpp"
+#include "utils/function.hpp"
+#include "source_compat.hpp"
+#include "game/l4d2.hpp"
+#include "game/l4d1.hpp"
+#include "game/functions.hpp"
+
+#include "components/loader.hpp"
 
 using namespace std::literals;

@@ -2,38 +2,109 @@
 #include "imgui_internal.h"
 #include "imgui_helper.hpp"
 
-#include "components/modules/interfaces.hpp"
-#include "components/modules/main_module.hpp"
-
 namespace common::imgui
 {
+	namespace
+	{
+		std::atomic<std::uint64_t> g_world2screen_calls = 0u;
+		std::atomic<std::uint64_t> g_world2screen_failures = 0u;
+		std::atomic<std::uint64_t> g_world2screen_fallback_successes = 0u;
+
+		bool finite_matrix(const VMatrix& matrix)
+		{
+			bool any_non_zero = false;
+			for (int row = 0; row < 4; ++row)
+			{
+				for (int column = 0; column < 4; ++column)
+				{
+					const float value = matrix.m[row][column];
+					if (!std::isfinite(value) || std::fabs(value) > 1000000.0f) return false;
+					any_non_zero |= std::fabs(value) > 0.000001f;
+				}
+			}
+			return any_non_zero;
+		}
+
+		bool camera_basis_projection(const Vector& in, Vector& out, const int screen_w, const int screen_h)
+		{
+			Vector origin = {}, forward = {}, right = {}, up = {};
+			if (!game::get_current_view_basis(origin, forward, right, up)) return false;
+			const Vector delta = in - origin;
+			const float depth = delta.Dot(forward);
+			if (!std::isfinite(depth) || depth <= 0.001f) return false;
+
+			float horizontal_fov = 90.0f;
+			if (const auto* fov = game::find_cvar_const("fov_desired"); fov)
+			{
+				const float candidate = fov->m_Value.m_fValue;
+				if (std::isfinite(candidate) && candidate >= 20.0f && candidate <= 160.0f) horizontal_fov = candidate;
+			}
+			const float tan_half_horizontal = std::tan(DEG2RAD(horizontal_fov * 0.5f));
+			if (!std::isfinite(tan_half_horizontal) || tan_half_horizontal <= 0.0001f) return false;
+			const float aspect = static_cast<float>(screen_w) / static_cast<float>(screen_h);
+			const float tan_half_vertical = tan_half_horizontal / std::max(0.1f, aspect);
+			out.x = static_cast<float>(screen_w) * 0.5f +
+				(delta.Dot(right) / (depth * tan_half_horizontal)) * static_cast<float>(screen_w) * 0.5f;
+			out.y = static_cast<float>(screen_h) * 0.5f -
+				(delta.Dot(up) / (depth * tan_half_vertical)) * static_cast<float>(screen_h) * 0.5f;
+			out.z = depth;
+			return std::isfinite(out.x) && std::isfinite(out.y);
+		}
+	}
+
 	bool world2screen(const Vector& in, Vector& out)
 	{
-		auto& matrix = interfaces::get()->m_engine->world_to_screen_matrix();
-
-		out.x = in.Dot(matrix.m[0]) + matrix.m[0][3];
-		out.y = in.Dot(matrix.m[1]) + matrix.m[1][3];
+		++g_world2screen_calls;
+		out.x = 0.0f;
+		out.y = 0.0f;
 		out.z = 0.0f;
-
-		const float perspective_div = in.Dot(matrix.m[3]) + matrix.m[3][3];
-		if (perspective_div < 0.001f)
+		const auto interfaces_ptr = interfaces::get();
+		if (!interfaces_ptr || !interfaces_ptr->m_engine)
 		{
-			out.x *= 100000.0f;
-			out.y *= 100000.0f;
+			++g_world2screen_failures;
 			return false;
 		}
 
-		out.x /= perspective_div;
-		out.y /= perspective_div;
+		int screen_w = 0, screen_h = 0;
+		interfaces_ptr->m_engine->get_screen_size(screen_w, screen_h);
+		if (screen_w <= 0 || screen_h <= 0)
+		{
+			++g_world2screen_failures;
+			return false;
+		}
 
-		int screen_w, screen_h;
-		interfaces::get()->m_engine->get_screen_size(screen_w, screen_h);
+		const auto& matrix = interfaces_ptr->m_engine->world_to_screen_matrix();
+		if (finite_matrix(matrix))
+		{
+			const float x = in.Dot(matrix.m[0]) + matrix.m[0][3];
+			const float y = in.Dot(matrix.m[1]) + matrix.m[1][3];
+			const float perspective_div = in.Dot(matrix.m[3]) + matrix.m[3][3];
+			if (std::isfinite(x) && std::isfinite(y) && std::isfinite(perspective_div) && perspective_div >= 0.001f)
+			{
+				out.x = static_cast<float>(screen_w) * 0.5f + (x / perspective_div) * static_cast<float>(screen_w) * 0.5f;
+				out.y = static_cast<float>(screen_h) * 0.5f - (y / perspective_div) * static_cast<float>(screen_h) * 0.5f;
+				out.z = perspective_div;
+				const float generous_x = static_cast<float>(screen_w) * 8.0f;
+				const float generous_y = static_cast<float>(screen_h) * 8.0f;
+				if (std::isfinite(out.x) && std::isfinite(out.y) &&
+					std::fabs(out.x) <= generous_x && std::fabs(out.y) <= generous_y) return true;
+			}
+			// A non-zero but stale Source matrix was one of the gizmo regressions after
+			// the Steam update. Do not fail here; try the validated camera basis below.
+		}
 
-		out.x = ((float)screen_w / 2.0f) + (out.x * (float)screen_w) / 2.0f;
-		out.y = ((float)screen_h / 2.0f) - (out.y * (float)screen_h) / 2.0f;
-
-		return true;
+		if (camera_basis_projection(in, out, screen_w, screen_h))
+		{
+			++g_world2screen_fallback_successes;
+			return true;
+		}
+		++g_world2screen_failures;
+		return false;
 	}
+
+	std::uint64_t world2screen_calls() { return g_world2screen_calls.load(); }
+	std::uint64_t world2screen_failures() { return g_world2screen_failures.load(); }
+	std::uint64_t world2screen_fallback_successes() { return g_world2screen_fallback_successes.load(); }
 
 	void get_and_add_integers_to_set(char* str, std::unordered_set<std::uint32_t>& set, const std::uint32_t& buf_len, const bool clear_buf)
 	{
@@ -173,128 +244,79 @@ namespace common::imgui
 			0.f);
 	}
 
-	// Blur window background
+	// V21.14.7 renderer-safe mode: keep the legacy blur entry points as no-ops.
+	// The original DX9 callback path sampled a render-target texture while writing
+	// to it, which is undefined under DXVK/RTX Remix and may tint the backbuffer.
 	void draw_window_blur()
 	{
-		// only blur the window, clip everything else
-		ImGuiWindow* window = ImGui::GetCurrentWindow();
-		ImGui::PushClipRect(window->InnerClipRect.Min, window->InnerClipRect.Max, true);
-
-		draw_blur(ImGui::GetWindowDrawList());
-		ImGui::PopClipRect();
 	}
 
-	// Blur entire background
 	void draw_background_blur()
 	{
-		draw_blur(ImGui::GetBackgroundDrawList());
 	}
 }
 
 namespace ImGui
 {
-	void CenterText(const char* text, bool disabled)
+	namespace
 	{
-		const auto text_width = CalcTextSize(text).x;
-		SetCursorPosX(GetContentRegionAvail().x * 0.5f - text_width * 0.5f);
-		if (!disabled) {
-			TextUnformatted(text);
-		}
-		else {
-			TextDisabled("%s", text);
-		}
+		StyleColorRecoveryStats g_style_color_recovery_stats = {};
 	}
 
-	void AddUnterline(ImColor col)
+	void SafePopStyleColor(const int count, const int source_line)
 	{
-		ImVec2 min = GetItemRectMin();
-		ImVec2 max = GetItemRectMax();
-		min.y = max.y;
-		GetWindowDrawList()->AddLine(min, max, col, 1.0f);
-	}
-
-	void TextURL(const char* name, const char* url, bool use_are_you_sure_popup)
-	{
-		TextUnformatted(name);
-		if (IsItemHovered())
+		if (count <= 0) return;
+		ImGuiContext* context = GetCurrentContext();
+		const int available = context ? context->ColorStack.Size : 0;
+		const int safe_count = std::clamp(count, 0, available);
+		if (safe_count > 0) {
+			PopStyleColor(safe_count);
+		}
+		if (safe_count != count)
 		{
-			if (IsMouseClicked(0))
-			{
-				if (use_are_you_sure_popup)
-				{
-					if (!IsPopupOpen("Are You Sure?"))
-					{
-						PushID(name);
-						OpenPopup("Are You Sure?");
-						PopID();
-					}
-				}
-				else
-				{
-					ImGuiIO& io = GetIO();
-					io.AddMouseButtonEvent(0, false);
-					io.AddMousePosEvent(0, 0);
-					ShellExecuteA(nullptr, nullptr, url, nullptr, nullptr, SW_SHOW);
-				}
-			}
-
-			AddUnterline(GetStyle().Colors[ImGuiCol_TabHovered]);
-			SetTooltip("Clicking this will open the following link:\n[%s]", url);
+			g_style_color_recovery_stats.prevented_underflows += static_cast<std::uint64_t>(count - safe_count);
+			g_style_color_recovery_stats.last_source_line = source_line;
+			g_style_color_recovery_stats.last_requested_count = count;
+			g_style_color_recovery_stats.last_available_count = available;
 		}
-		else {
-			AddUnterline(GetStyle().Colors[ImGuiCol_Button]);
-		}
-
-		PushID(name);
-		if (BeginPopupModal("Are You Sure?", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
-		{
-			common::imgui::draw_background_blur();
-			Spacing(0.0f, 0.0f);
-
-			const auto half_width = GetContentRegionMax().x * 0.5f;
-			auto line1_str = "This will open the following link:";
-
-			Spacing();
-			SetCursorPosX(5.0f + half_width - (CalcTextSize(line1_str).x * 0.5f));
-			TextUnformatted(line1_str);
-
-			PushFont(common::imgui::font::BOLD);
-			SetCursorPosX(5.0f + half_width - (CalcTextSize(url).x * 0.5f));
-			TextUnformatted(url);
-
-			InvisibleButton("##spacer", ImVec2(CalcTextSize(url).x, 1));
-			PopFont();
-
-			Spacing(0, 8);
-			Spacing(0, 0); SameLine();
-
-			ImVec2 button_size(half_width - 6.0f - GetStyle().WindowPadding.x, 0.0f);
-			if (Button("Open", button_size))
-			{
-				ImGuiIO& io = GetIO();
-				io.AddMouseButtonEvent(0, false);
-				io.AddMousePosEvent(0, 0);
-				CloseCurrentPopup();
-				ShellExecuteA(nullptr, nullptr, url, nullptr, nullptr, SW_SHOW);
-			}
-
-			SameLine(0, 6.0f);
-			if (Button("Cancel", button_size)) {
-				CloseCurrentPopup();
-			}
-
-			EndPopup();
-		}
-		PopID();
 	}
 
-	void SetCursorForCenteredText(const char* text)
+	int GetStyleColorStackSize()
 	{
-		//SetCursorPosX((GetWindowSize().x - CalcTextSize(text).x) * 0.5f);
-		const auto text_width = CalcTextSize(text).x;
-		SetCursorPosX(GetContentRegionAvail().x * 0.5f - text_width * 0.5f);
+		const ImGuiContext* context = GetCurrentContext();
+		return context ? context->ColorStack.Size : 0;
 	}
 
+	void RecoverStyleColorStack(const int target_size, const int source_line)
+	{
+		ImGuiContext* context = GetCurrentContext();
+		if (!context) return;
+		const int current = context->ColorStack.Size;
+		if (current <= target_size) return;
+		const int leaked = current - target_size;
+		PopStyleColor(leaked);
+		g_style_color_recovery_stats.recovered_leaks += static_cast<std::uint64_t>(leaked);
+		g_style_color_recovery_stats.last_source_line = source_line;
+		g_style_color_recovery_stats.last_requested_count = leaked;
+		g_style_color_recovery_stats.last_available_count = current;
+	}
+
+	void RunWithStyleColorCheckpoint(const std::function<void()>& callback, const int source_line)
+	{
+		const int target_size = GetStyleColorStackSize();
+		callback();
+		RecoverStyleColorStack(target_size, source_line);
+	}
+
+	StyleColorRecoveryStats GetStyleColorRecoveryStats()
+	{
+		return g_style_color_recovery_stats;
+	}
+
+	void ResetStyleColorRecoveryStats()
+	{
+		g_style_color_recovery_stats = {};
+	}
 	void Spacing(const float& x, const float& y) {
 		Dummy(ImVec2(x, y));
 	}
@@ -430,7 +452,7 @@ namespace ImGui
 	void Style_DeleteButtonPop()
 	{
 		PopStyleVar(2);
-		PopStyleColor(4);
+		SafePopStyleColor(4, __LINE__);
 		PopFont();
 	}
 
@@ -448,7 +470,7 @@ namespace ImGui
 	}
 
 	void Style_ColorButtonPop() {
-		PopStyleColor(4);
+		SafePopStyleColor(4, __LINE__);
 	}
 
 	// #
@@ -459,7 +481,7 @@ namespace ImGui
 	}
 
 	void Style_InvisibleSelectorPop() {
-		PopStyleColor(2);
+		SafePopStyleColor(2, __LINE__);
 	}
 
 	// #
@@ -510,7 +532,7 @@ namespace ImGui
 			if (!BeginTooltipBlurEx(ImGuiTooltipFlags_OverridePrevious, ImGuiWindowFlags_None)) {
 				return;
 			}
-			PopStyleColor();
+			SafePopStyleColor(1, __LINE__);
 
 			const auto padding = 4.0f;
 
@@ -564,6 +586,17 @@ namespace ImGui
 	float CalcWidgetWidthForChild(const float label_width)
 	{
 		return GetContentRegionAvail().x - 4.0f - (label_width + GetStyle().ItemInnerSpacing.x + GetStyle().FramePadding.y);
+	}
+
+	void CenterText(const char* text, bool disabled)
+	{
+		SetCursorPosX(GetContentRegionAvail().x * 0.5f - CalcTextSize(text).x * 0.5f);
+		if (!disabled) {
+			TextUnformatted(text);
+		}
+		else {
+			TextDisabled("%s", text);
+		}
 	}
 
 	bool TextUnformatted_ClippedByColumnTooltip(const char* str)
@@ -647,7 +680,7 @@ namespace ImGui
 					clicked = true;
 				}
 
-				PopStyleColor(4);
+				SafePopStyleColor(4, __LINE__);
 				PopStyleVar(2);
 				//PopFont();
 
@@ -765,7 +798,7 @@ namespace ImGui
 					clicked = true;
 				}
 
-				PopStyleColor(4);
+				SafePopStyleColor(4, __LINE__);
 				PopStyleVar(2);
 				//PopFont();
 
@@ -879,7 +912,7 @@ namespace ImGui
 					clicked = true;
 				}
 
-				PopStyleColor(4);
+				SafePopStyleColor(4, __LINE__);
 				PopStyleVar(2);
 				//PopFont();
 
@@ -1018,7 +1051,7 @@ namespace ImGui
 		const auto state = CollapsingHeader(title_text, open_flag | ImGuiTreeNodeFlags_SpanFullWidth);
 
 		if (is_open) {
-			PopStyleColor();
+			SafePopStyleColor(1, __LINE__);
 		}
 
 		if (IsItemHovered() && IsMouseClicked(ImGuiMouseButton_Middle, false)) {
@@ -1030,7 +1063,7 @@ namespace ImGui
 			//SetScrollHereY(0.0f); 
 		}
 
-		PopStyleColor();
+		SafePopStyleColor(1, __LINE__);
 		PopStyleVar(2);
 
 		return state;
@@ -1088,23 +1121,23 @@ namespace ImGui
 			PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(2.0f, 4.0f));
 			PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(6.0f, 8.0f));
 			BeginChild(child_name, ImVec2(max.x - min.x - style.FramePadding.x - 2.0f, 0.0f),
-				/*ImGuiChildFlags_Borders | */ ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+				/*ImGuiChildFlags_Borders | */ ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY,
+				ImGuiWindowFlags_HorizontalScrollbar);
 
 			Indent(child_indent);
-			PushClipRect(min, max, true);
-			if (callback)
-			{
-				Indent(4);
-				callback();
-				Unindent(4);
-			}
-			PopClipRect();
+			// V21.4: do not clip the auto-resizing child to the height cached by the
+			// previous frame. The old clip rectangle made newly revealed controls
+			// visible to layout but impossible to see or scroll to until the cached
+			// height happened to catch up. The child itself already clips to the
+			// parent window, so an additional stale-height clip is both redundant
+			// and unsafe for dynamic/collapsible content.
+			callback();
 			Unindent(child_indent);
 
 			EndChild();
 			PopStyleVar(2);
 		}
-		SetCursorScreenPos(GetCursorScreenPos() + ImVec2(0, 8.0f));
+		SetCursorScreenPos(GetCursorScreenPos() + ImVec2(0, expanded ? 36.0f : 8.0f));
 		return GetItemRectSize().y + 6.0f/*- 28.0f*/;
 	}
 

@@ -5,6 +5,9 @@
 namespace common::imgui
 {
 	bool world2screen(const Vector& in, Vector& out);
+	std::uint64_t world2screen_calls();
+	std::uint64_t world2screen_failures();
+	std::uint64_t world2screen_fallback_successes();
 
 	void get_and_add_integers_to_set(char* str, std::unordered_set<std::uint32_t>& set, const std::uint32_t& buf_len = 0u, bool clear_buf = false);
 	void get_and_remove_integers_from_set(char* str, std::unordered_set<std::uint32_t>& set, const std::uint32_t& buf_len = 0u, bool clear_buf = false);
@@ -63,11 +66,6 @@ namespace common::imgui
 
 namespace ImGui
 {
-	void CenterText(const char* text, bool disabled = false);
-	void AddUnterline(ImColor col);
-	void TextURL(const char* name, const char* url, bool use_are_you_sure_popup = false);
-	void SetCursorForCenteredText(const char* text);
-
 	void Spacing(const float& x, const float& y);
 	void PushFont(common::imgui::font::FONTS font);
 	void SeparatorTextLarge(const char* text, bool pre_spacing = false);
@@ -81,6 +79,23 @@ namespace ImGui
 	};
 
 	void Widget_UnorderedSetModifier(const char* id, Widget_UnorderedSetModifierFlags flag, std::unordered_set<std::uint32_t>& set, char* buffer, std::uint32_t buffer_len);
+
+
+	struct StyleColorRecoveryStats
+	{
+		std::uint64_t prevented_underflows = 0u;
+		std::uint64_t recovered_leaks = 0u;
+		int last_source_line = 0;
+		int last_requested_count = 0;
+		int last_available_count = 0;
+	};
+
+	void SafePopStyleColor(int count = 1, int source_line = 0);
+	int GetStyleColorStackSize();
+	void RecoverStyleColorStack(int target_size, int source_line = 0);
+	void RunWithStyleColorCheckpoint(const std::function<void()>& callback, int source_line = 0);
+	StyleColorRecoveryStats GetStyleColorRecoveryStats();
+	void ResetStyleColorRecoveryStats();
 
 	void Style_DeleteButtonPush();
 	void Style_DeleteButtonPop();
@@ -97,6 +112,7 @@ namespace ImGui
 	// #
 
 	float CalcWidgetWidthForChild(float label_width);
+	void CenterText(const char* text, bool disabled = false);
 	bool TextUnformatted_ClippedByColumnTooltip(const char* str);
 
 	void Draw3DCircle(ImDrawList* draw_list, const Vector& world_pos, const Vector& normal, float radius, bool filled, const ImColor& color, const float& thickness, int num_points = 200);

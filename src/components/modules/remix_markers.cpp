@@ -1,21 +1,24 @@
 #include "std_include.hpp"
-#include "remix_markers.hpp"
-
-#include "interfaces.hpp"
-#include "map_settings.hpp"
-#include "model_render.hpp"
 
 namespace components
 {
 	// draw 'nocull' map_setting marker meshes
-	void remix_markers::draw_nocull_markers()
+	void remix_markers::draw_nocull_markers(const bool allow_repeat)
 	{
+		const auto frame = main_module::framecount;
+		if (!allow_repeat && m_last_draw_frame == frame) return;
+
 		g_sunoverlay_color.clear(); // TODO: this should be moved somewhere else
-
-		// -----
-
 		const auto& msettings = map_settings::get_map_settings();
 		const auto dev = game::get_d3d_device();
+		if (!dev)
+		{
+			++m_draw_no_device;
+			return;
+		}
+		m_last_draw_frame = frame;
+		++m_draw_calls;
+		std::uint64_t markers_drawn_this_call = 0u;
 
 		struct vertex { D3DXVECTOR3 position; D3DCOLOR color; float tu, tv; };
 
@@ -33,22 +36,37 @@ namespace components
 		dev->GetTexture(0, &og_tex);
 		dev->SetTexture(0, tex_addons::white);
 
-		DWORD og_rs;
-		dev->GetRenderState((D3DRENDERSTATETYPE)150, &og_rs);
+		DWORD og_fvf = 0;
+		dev->GetFVF(&og_fvf);
+
+		D3DMATRIX og_world = game::IDENTITY;
+		dev->GetTransform(D3DTS_WORLD, &og_world);
+
+		DWORD og_rs150 = 0;
+		DWORD og_rs153 = 0;
+		dev->GetRenderState((D3DRENDERSTATETYPE)150, &og_rs150);
+		dev->GetRenderState((D3DRENDERSTATETYPE)153, &og_rs153);
 
 		dev->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 		//D3DXMATRIX mtx = game::IDENTITY;
 
+		const auto view_origin = game::get_current_view_origin();
 		for (auto& m : msettings.map_markers)
 		{
-			// ignore normal markers
-			if (!m.no_cull) {
+			// Render authored no-cull markers and normal markers whose server-side
+			// dynamic_prop creation failed after the Steam update.
+			if (!m.no_cull && !m.runtime_nocull_fallback) {
 				continue;
 			}
 
-			// main_module::pre_recursive_world_node
-			if (m.is_hidden) {
+			// main_module::pre_recursive_world_node + authored visibility controls
+			if (!m.visible || m.is_hidden) {
 				continue;
+			}
+			if (view_origin && m.visibility_range > 0.0f)
+			{
+				const auto delta = m.origin - *view_origin;
+				if (delta.LengthSqr() > m.visibility_range * m.visibility_range) continue;
 			}
 
 			const float f_index = static_cast<float>(m.index);
@@ -73,12 +91,18 @@ namespace components
 
 			// set remix texture hash ~req. dxvk-runtime changes - not really needed
 			dev->SetRenderState((D3DRENDERSTATETYPE)150, 100 + m.index);
+			dev->SetRenderState((D3DRENDERSTATETYPE)153, 0u);
 
 			dev->SetTransform(D3DTS_WORLD, &world);
-			dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, mesh_verts, sizeof(vertex));
+			if (SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, mesh_verts, sizeof(vertex)))) {
+				++markers_drawn_this_call;
+			}
 		}
 
-		// #HACK: render single tri with rain_drop texture so remix loads the texture
+		// #HACK: render single tri with rain_drop texture so remix loads the texture.
+		// Clear both custom-hash DWORDs so the last marker's high state cannot leak. RS153 is unused; RS151 remains vertex blending.
+		dev->SetRenderState((D3DRENDERSTATETYPE)150, 0u);
+		dev->SetRenderState((D3DRENDERSTATETYPE)153, 0u);
 		{
 			const vertex mesh_verts[3] =
 			{
@@ -92,12 +116,24 @@ namespace components
 			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, mesh_verts, sizeof(vertex));
 		}
 
-		// restore
+		// Restore exact game state. GetVertexShader/GetTexture return owned COM
+		// references, which must be released after rebinding.
 		dev->SetVertexShader(og_vs);
 		dev->SetTexture(0, og_tex);
-		dev->SetRenderState((D3DRENDERSTATETYPE)150, og_rs);
-		dev->SetFVF(NULL);
-		dev->SetTransform(D3DTS_WORLD, &game::IDENTITY);
+		dev->SetRenderState((D3DRENDERSTATETYPE)150, og_rs150);
+		dev->SetRenderState((D3DRENDERSTATETYPE)153, og_rs153);
+		dev->SetFVF(og_fvf);
+		dev->SetTransform(D3DTS_WORLD, &og_world);
+
+		if (og_vs) {
+			og_vs->Release();
+			og_vs = nullptr;
+		}
+		if (og_tex) {
+			og_tex->Release();
+			og_tex = nullptr;
+		}
+		m_drawn_markers += markers_drawn_this_call;
 	}
 
 	// sound_events::on_start_sound_hk
@@ -225,6 +261,7 @@ namespace components
 		if (!interfaces::get()->m_engine->is_paused())
 		{
 			const auto globalv = interfaces::get()->m_globals;
+			const auto view_origin = game::get_current_view_origin();
 
 			for (auto& m : map_settings::get_map_settings().map_markers)
 			{
@@ -252,6 +289,23 @@ namespace components
 						m.trigger_hide.delay_elapsed_time += globalv->frametime;
 					}
 				}
+
+				// Normal marker props are persistent server entities. Update EF_NODRAW instead
+				// of destroying/recreating them when trigger/range visibility changes.
+				if (!m.no_cull && !m.runtime_nocull_fallback && m.handle)
+				{
+					bool outside_range = false;
+					if (view_origin && m.visibility_range > 0.0f)
+					{
+						const auto delta = m.origin - *view_origin;
+						outside_range = delta.LengthSqr() > m.visibility_range * m.visibility_range;
+					}
+
+					constexpr int EF_NODRAW = 0x20;
+					auto& effects = *reinterpret_cast<int*>(reinterpret_cast<std::uintptr_t>(m.handle) + 0xE0);
+					if (!m.visible || m.is_hidden || outside_range) effects |= EF_NODRAW;
+					else effects &= ~EF_NODRAW;
+				}
 			}
 		}
 	}
@@ -259,7 +313,5 @@ namespace components
 	remix_markers::remix_markers()
 	{
 		p_this = this;
-		m_initialized = true;
-		log("RemixMarkers", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
 	}
 }

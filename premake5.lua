@@ -1,3 +1,212 @@
+-- stealy wheely :* https://github.com/XLabsProject/s1x-client/blob/develop/premake5.lua
+
+gitVersioningCommand = "git describe --tags --dirty --always"
+gitCurrentBranchCommand = "git symbolic-ref -q --short HEAD"
+
+-- Returns command output as a single trimmed line.
+-- Safe for source archives without a .git directory.
+function readcmdline(command, fallback)
+	local proc = io.popen(command .. " 2>nul", "r")
+	if proc == nil then
+		return fallback or ""
+	end
+
+	local output = proc:read('*l')
+	proc:close()
+
+	if output == nil or output == "" then
+		return fallback or ""
+	end
+
+	return output:gsub("%s+$", "")
+end
+
+function readcmdall(command, fallback)
+	local proc = io.popen(command .. " 2>nul", "r")
+	if proc == nil then
+		return fallback or ""
+	end
+
+	local output = proc:read('*a')
+	proc:close()
+
+	if output == nil or output == "" then
+		return fallback or ""
+	end
+
+	return output:gsub("%s+", "")
+end
+
+-- Quote the given string input as a C string
+function cstrquote(value)
+	if value == nil then
+		return "\"\""
+	end
+	result = value:gsub("\\", "\\\\")
+	result = result:gsub("\"", "\\\"")
+	result = result:gsub("\n", "\\n")
+	result = result:gsub("\t", "\\t")
+	result = result:gsub("\r", "\\r")
+	result = result:gsub("\a", "\\a")
+	result = result:gsub("\b", "\\b")
+	result = "\"" .. result .. "\""
+	return result
+end
+
+-- Converts tags in "vX.X.X" format and given revision number Y to an array of numbers {X,X,X,Y}.
+-- In the case where the format does not work fall back to padding with zeroes and just ending with the revision number.
+-- partscount can be either 3 or 4.
+function vertonumarr(value, vernumber, partscount)
+	vernum = {}
+	for num in string.gmatch(value or "", "%d+") do
+		if #vernum < 3 then
+			table.insert(vernum, tonumber(num))
+		end
+	end
+	while #vernum < 3 do
+		table.insert(vernum, 0)
+	end
+	if #vernum < partscount then
+		table.insert(vernum, tonumber(vernumber))
+	end
+	return vernum
+end
+
+newaction {
+	trigger = "version",
+	description = "Returns the version string for the current commit of the source code.",
+	onWorkspace = function(wks)
+		-- get current version via git (fallback when building from source archive without .git)
+		local gitDescribeOutput = readcmdall(gitVersioningCommand, "V21.14.10-source")
+		local version = gitDescribeOutput
+
+		local gitCurrentBranchOutput = readcmdall(gitCurrentBranchCommand, "")
+		local gitCurrentBranchSuccess = gitCurrentBranchOutput ~= ""
+		if gitCurrentBranchSuccess then
+			-- We got a branch name, check if it is a feature branch
+			if gitCurrentBranchOutput ~= "develop" and gitCurrentBranchOutput ~= "master" then
+				version = version .. "-" .. gitCurrentBranchOutput
+			end
+		end
+
+		print(version)
+		os.exit(0)
+	end
+}
+
+newaction {
+	trigger = "generate-buildinfo",
+	description = "Sets up build information file like version.h.",
+	onWorkspace = function(wks)
+		-- make sure generated build-info folders exist, also when the action is run standalone
+		os.mkdir(wks.location)
+		os.mkdir(wks.location .. "/src")
+
+		-- get old version number from version.hpp if any
+		local oldVersion = "(none)"
+		local oldVersionHeader = io.open(wks.location .. "/src/version.h", "r")
+		if oldVersionHeader ~= nil then
+			local oldVersionHeaderContent = assert(oldVersionHeader:read('*l'))
+			while oldVersionHeaderContent do
+				m = string.match(oldVersionHeaderContent, "#define GIT_DESCRIBE (.+)%s*$")
+				if m ~= nil then
+						oldVersion = m
+				end
+
+				oldVersionHeaderContent = oldVersionHeader:read('*l')
+			end
+		end
+
+		-- get current version via git (fallback when building from source archive without .git)
+		local gitDescribeOutput = readcmdall(gitVersioningCommand, "V21.14.10-source")
+
+		-- generate version.hpp with a revision number if not equal
+		gitDescribeOutputQuoted = cstrquote(gitDescribeOutput)
+		if oldVersion ~= gitDescribeOutputQuoted then
+			-- get current git hash and write to version.txt (used by the preliminary updater)
+			-- TODO - remove once proper updater and release versioning exists
+			local gitCommitHash = readcmdall("git rev-parse HEAD", "archive")
+
+			-- get whether this is a clean revision (no uncommitted changes)
+			local gitStatus = readcmdall("git status --porcelain", "")
+			local revDirty = gitStatus ~= "" and 1 or 0
+
+			-- get current tag name
+			local tagName = readcmdline("git describe --tags --abbrev=0", "21.14.10")
+
+			-- get current branch name
+			local branchName = readcmdline("git branch --show-current", "")
+
+			-- branch for ci
+			if branchName == nil or branchName == '' then
+				local branchInfo = readcmdline("git show -s --pretty=%d HEAD", "")
+				if branchInfo ~= nil and branchInfo ~= '' then
+					m = string.match(branchInfo, ".+,.+, ([^)]+)")
+					if m ~= nil then
+						branchName = m
+					end
+				end
+			end
+
+			if branchName == nil or branchName == '' then
+				branchName = "archive"
+			end
+
+			print("Detected branch: " .. branchName)
+
+			-- get revision number via git
+			local revNumber = readcmdall("git rev-list --count HEAD", "0")
+
+			print ("Update " .. oldVersion .. " -> " .. gitDescribeOutputQuoted)
+
+			-- write to version.txt for preliminary updater
+			-- NOTE - remove this once we have a proper updater and proper release versioning
+			local versionFile = assert(io.open(wks.location .. "/version.txt", "w"))
+			versionFile:write(gitCommitHash)
+			versionFile:close()
+
+			-- write version header
+			local versionHeader = assert(io.open(wks.location .. "/src/version.h", "w"))
+			versionHeader:write("/*\n")
+			versionHeader:write(" * Automatically generated by premake5.\n")
+			versionHeader:write(" * Do not touch!\n")
+			versionHeader:write(" */\n")
+			versionHeader:write("\n")
+			versionHeader:write("#define GIT_DESCRIBE " .. gitDescribeOutputQuoted .. "\n")
+			versionHeader:write("#define GIT_DIRTY " .. revDirty .. "\n")
+			versionHeader:write("#define GIT_HASH " .. cstrquote(gitCommitHash) .. "\n")
+			versionHeader:write("#define GIT_TAG " .. cstrquote(tagName) .. "\n")
+			versionHeader:write("#define GIT_BRANCH " .. cstrquote(branchName) .. "\n")
+			versionHeader:write("\n")
+			versionHeader:write("// Version transformed for RC files\n")
+			versionHeader:write("#define VERSION_PRODUCT_RC " .. table.concat(vertonumarr(tagName, revNumber, 3), ",") .. "\n")
+			versionHeader:write("#define VERSION_PRODUCT " .. gitDescribeOutputQuoted .. "\n")
+			versionHeader:write("#define VERSION_FILE_RC " .. table.concat(vertonumarr(tagName, revNumber, 3), ",") .. "\n")
+			versionHeader:write("#define VERSION_FILE " .. gitDescribeOutputQuoted .. "\n")
+			versionHeader:write("\n")
+			versionHeader:write("// Alias definitions\n")
+			versionHeader:write("#define VERSION GIT_DESCRIBE\n")
+			versionHeader:write("#define SHORTVERSION VERSION_PRODUCT\n")
+			versionHeader:close()
+			local versionHeader = assert(io.open(wks.location .. "/src/version.hpp", "w"))
+			versionHeader:write("/*\n")
+			versionHeader:write(" * Automatically generated by premake5.\n")
+			versionHeader:write(" * Do not touch!\n")
+			versionHeader:write(" *\n")
+			versionHeader:write(" * This file exists for reasons of complying with our coding standards.\n")
+			versionHeader:write(" *\n")
+			versionHeader:write(" * The Resource Compiler will ignore any content from C++ header files if they're not from STDInclude.hpp.\n")
+			versionHeader:write(" * That's the reason why we now place all version info in version.h instead.\n")
+			versionHeader:write(" */\n")
+			versionHeader:write("\n")
+			versionHeader:write("#include \".\\version.h\"\n")
+			versionHeader:close()
+		end
+	end
+}
+
+-----------------------------------------------------------------------------
+
 dependencies = {
 	basePath = "./deps"
 }
@@ -125,6 +334,7 @@ workspace "l4d2-rtx"
 		files {
 			"./src/**.rc",
 			"./src/**.hpp",
+			"./src/**.inl",
 			"./src/**.cpp",
 		}
 
@@ -142,7 +352,12 @@ workspace "l4d2-rtx"
         }
 
 		filter "configurations:Debug or configurations:Release"
-			if(os.getenv("L4D2_ROOT")) then
+			if(os.getenv("L4D1_ROOT")) then
+				print ("Setup paths using environment variable 'L4D1_ROOT' :: '" .. os.getenv("L4D1_ROOT") .. "'")
+				targetdir(os.getenv("L4D1_ROOT"))
+				debugdir (os.getenv("L4D1_ROOT"))
+				debugcommand (os.getenv("L4D1_ROOT") .. "/" .. "run-l4d1-rtx-bootstrap.bat")
+			elseif(os.getenv("L4D2_ROOT")) then
 				print ("Setup paths using environment variable 'L4D2_ROOT' :: '" .. os.getenv("L4D2_ROOT") .. "'")
 				targetdir(os.getenv("L4D2_ROOT"))
 				debugdir (os.getenv("L4D2_ROOT"))
@@ -157,46 +372,52 @@ workspace "l4d2-rtx"
 
 		warnings "Extra"
 
+		-- Pre-build
+		prebuildcommands {
+			"pushd %{_MAIN_SCRIPT_DIR}",
+			"tools\\premake5 generate-buildinfo",
+			"popd",
+		}
+
 		dependencies.imports()
 
         group "Dependencies"
             dependencies.projects()
 		group ""
-	
 
 project "installer"
     kind "ConsoleApp"
-	targetname "L4D2-Remix-CompMod-Installer"
+    targetname "L4D2-Remix-CompMod-Installer"
     language "C++"
     cppdialect "C++20"
     staticruntime "On"
     targetdir "./bin"
-    
 
-	files {
-		"./src_installer/**.hpp",
-		"./src_installer/**.cpp",
-		"./deps/miniz/miniz.c",
-		"./deps/miniz/miniz.h",
-		"./src_installer/installer.rc",
-		"./src_installer/installer.manifest"
-	}
+    files {
+        "./src_installer/**.hpp",
+        "./src_installer/**.cpp",
+        "./deps/miniz/miniz.c",
+        "./deps/miniz/miniz.h",
+        "./src_installer/installer.rc",
+        "./src_installer/installer.manifest"
+    }
 
-	includedirs {
-		"%{prj.location}/src_installer",
-		"./src_installer",
-		"./deps/miniz",
-	}
+    includedirs {
+        "%{prj.location}/src_installer",
+        "./src_installer",
+        "./deps/miniz",
+    }
 
     filter "configurations:Release*"
         optimize "Full"
         flags { "LinkTimeOptimization" }
-	filter {}
+    filter {}
 
-	flags { "NoManifest" }     -- prevents VS/mt.exe from generating its own
+    flags { "NoManifest" }
 
-	dependencies.imports()
+    dependencies.imports()
 
-	group "Dependencies"
-		dependencies.projects()
-	group ""
+    group "Dependencies"
+        dependencies.projects()
+    group ""
+

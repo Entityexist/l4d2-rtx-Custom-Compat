@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 namespace sdk
 {
@@ -232,6 +232,8 @@ namespace sdk
 		void* networkable();
 		collideable_t* get_collideable();
 		Vector get_absolute_origin();
+		Vector get_absolute_angles();
+		std::uint32_t get_ref_handle_raw();
 		c_client_class* client_class();
 		bool is_dormant();
 		const char* get_player_model_name();

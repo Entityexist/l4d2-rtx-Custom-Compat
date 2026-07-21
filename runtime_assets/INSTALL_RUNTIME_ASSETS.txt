@@ -1,0 +1,12 @@
+L4D2 RTX V21.7 runtime assets
+
+Build-V21.7.ps1 stages these files automatically under:
+  build\bin\Release\l4d2-rtx\
+
+To install the About artwork directly into a game root, run:
+  runtime_assets\INSTALL_RUNTIME_ASSETS_TO_GAME_ROOT.bat "D:\SteamLibrary\steamapps\common\Left 4 Dead 2"
+
+Installed file:
+  l4d2-rtx\textures\xorxor4d_strawberry.png
+
+The UI has a text fallback when the image is not present.

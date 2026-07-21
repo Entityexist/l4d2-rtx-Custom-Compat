@@ -1,0 +1,25 @@
+L4D2 RTX Compat V21.14.10 validation report
+
+PASS: Python syntax compilation of validate_trace_ray_abi_remix_category_v21_14_10.py
+PASS: V21.14.10 TraceRay ABI and Remix category isolation source validator
+PASS: Source Material Bridge ABI v2 validator
+PASS: x86 C++20 compile-time layout test
+      sizeof(Ray_t)      = 80
+      sizeof(CBaseTrace) = 56
+      sizeof(CGameTrace) = 84
+PASS: supplied binary set coherence audit
+      shaderapidx9.dll, engine.dll, studiorender.dll and client.dll use June 30, 2026 PE timestamps
+PASS: 51/51 compatibility patterns matched exactly once
+PASS: 51/51 resolved pattern RVAs match the project baseline
+PASS: EngineTraceClient003 vtable binary audit
+      slot 4 -> engine.dll RVA 0x179FF0 (ClipRayToCollideable path)
+      slot 5 -> engine.dll RVA 0x179760 (TraceRay path)
+PASS: RS42 is scoped immediately around ImGui draw submission
+PASS: RS42 is explicitly reset to neutral 0 after ImGui and at state-guard exit
+PASS: braces/namespace structural checks inherited from the full V21.14.9 validator
+
+Not performed in this environment:
+- Full MSVC Win32 DLL link
+- Runtime launch under L4D2 + RTX Remix
+
+Use Build-V21.14.10.ps1 with MSVC Win32 and the Windows SDK.

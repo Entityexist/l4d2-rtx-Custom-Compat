@@ -1,0 +1,40 @@
+name: Build and validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Validate current source contracts
+        shell: pwsh
+        run: |
+          .\Validate-TraceRayAbiRemixCategory-V21.14.10.ps1
+          .\Validate-L4D1-Bootstrap-R1.ps1
+
+      - name: Build Win32 Release
+        shell: pwsh
+        run: .\BUILD.ps1 -Target L4D2 -Configuration Release -Clean -SkipValidation
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: l4d2-rtx-win32-release
+          if-no-files-found: error
+          path: |
+            build/bin/Release/l4d2-rtx.dll
+            build/bin/Release/l4d2-rtx.pdb

@@ -1,9 +1,8 @@
 #pragma once
-#include <shared_mutex>
 
 namespace components
 {
-	class remix_vars final : public loader::component_module
+	class remix_vars : public component
 	{
 	public:
 		remix_vars();
@@ -11,14 +10,6 @@ namespace components
 
 		static inline remix_vars* p_this = nullptr;
 		static remix_vars* get() { return p_this; }
-
-		static bool is_initialized()
-		{
-			if (const auto mod = get(); mod && mod->m_initialized) {
-				return true;
-			}
-			return false;
-		}
 
 		static void xo_vars_parse_options_fn();
 
@@ -66,32 +57,12 @@ namespace components
 				return std::memcmp(this, &o, sizeof(option_value)) != 0;
 			}
 
+			bool compare(OPTION_TYPE type, const option_value& o) const;
+
 			bool enabled;
 			int integer;
 			float value;
 			float vector[4];
-
-			// return true if option_values match
-			bool compare(const OPTION_TYPE& type, const option_value& other, float eps = 1e-6f) const
-			{
-				switch (type)
-				{
-				case OPTION_TYPE_BOOL:    return enabled == other.enabled;
-				case OPTION_TYPE_INT:     return integer == other.integer;
-				case OPTION_TYPE_FLOAT:   return std::abs(value - other.value) <= eps;
-				case OPTION_TYPE_VEC2:
-				case OPTION_TYPE_VEC3:
-					for (int i = 0; i < 3; ++i)
-					{
-						if (std::abs(vector[i] - other.vector[i]) > eps) {
-							return false;
-						}
-					}
-					return true;
-				default:
-					return false;
-				}
-			}
 		};
 
 		struct option_s
@@ -125,10 +96,20 @@ namespace components
 			bool modified;
 		};
 
-		typedef std::pair<const std::string, option_s>* option_handle;
-		std::unordered_map<std::string, option_s> options;
-		std::unordered_map<std::string, option_s> custom_options;
-		mutable std::shared_mutex mutex_;
+		// std::map keeps pair addresses stable while new options are inserted.  The old
+		// unordered_map invalidated option_handle values during rehash and could break
+		// active transitions, UI snapshots and sound-triggered changes.
+		using option_map = std::map<std::string, option_s>;
+		typedef option_map::value_type* option_handle;
+		static inline option_map options;
+		static inline option_map custom_options;
+		static inline std::recursive_mutex mutex_;
+
+		struct option_snapshot
+		{
+			std::string name;
+			option_s option;
+		};
 
 		static option_handle	add_custom_option(const std::string& name, const option_s& o);
 		static option_handle	get_custom_option(const char* o);
@@ -139,6 +120,9 @@ namespace components
 		static bool				set_option(option_handle o, const option_value& v, bool is_level_setting = false, bool always = false);
 		static bool				reset_option(option_handle o, bool reset_to_level_state = false);
 		static void				reset_all_modified(bool reset_to_level_state = false);
+		static std::vector<option_snapshot> options_snapshot(bool modified_only = false);
+		static bool				has_interpolation_identifier(std::uint64_t identifier);
+		static void				clear_transitions();
 		static option_value		string_to_option_value(OPTION_TYPE type, const std::string& str);
 		static option_s			string_to_option(const std::string& str);
 		static void				parse_rtx_options();
@@ -172,8 +156,5 @@ namespace components
 		//static bool add_progressive_interpolate_entry(option_handle handle, const option_value& goal, float speed, const std::string& remix_var_name = "");
 
 		bool add_interpolate_entry(const std::uint64_t& identifier, option_handle handle, const option_value& goal, float duration, float delay, float delay_transition_back, EASE_TYPE ease, const std::string& remix_var_name = "");
-	
-		private:
-			bool m_initialized = false;
 	};
 }

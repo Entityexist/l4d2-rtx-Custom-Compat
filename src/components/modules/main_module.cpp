@@ -1,15 +1,5 @@
 #include "std_include.hpp"
-#include "main_module.hpp"
-#include "game_settings.hpp"
-#include "imgui.hpp"
-#include "interfaces.hpp"
-#include "map_settings.hpp"
-#include "model_render.hpp"
-#include "remix_api.hpp"
-#include "remix_lights.hpp"
-#include "remix_markers.hpp"
-
-#define USE_BUILD_WORLD_LIST_NOCULL 0 // no patterns
+#define USE_BUILD_WORLD_LIST_NOCULL 0
 
 namespace components
 {
@@ -20,6 +10,23 @@ namespace components
 
 	int g_current_leaf = -1;
 	int g_current_area = -1;
+
+	// Populated immediately before VIEW_3DSKY BSP recursion. It contains only
+	// leaves from sky_camera.area and their parent chain, avoiding accidental
+	// duplication of the main map when capture temporarily disables culling.
+	std::unordered_set<const mnode_t*> g_full_resident_sky_capture_nodes;
+
+	bool full_resident_world_data_sane(const worldbrushdata_t* world)
+	{
+		// Do not touch BSP arrays while hoststate is transitioning between maps.
+		// The broad upper limit protects against a stale/mismatched structure layout
+		// turning a count into an unbounded memory write.
+		constexpr int k_max_bsp_elements = 1 << 20;
+		return world &&
+			world->nodes && world->leafs &&
+			world->numnodes > 0 && world->numnodes <= k_max_bsp_elements &&
+			world->numleafs > 0 && world->numleafs <= k_max_bsp_elements;
+	}
 
 	bool g_player_leaf_update = false;
 	map_settings::area_overrides_s* g_player_current_area_override = nullptr; // contains overrides for the current area, nullptr if no overrides exist
@@ -32,6 +39,27 @@ namespace components
 
 	void on_renderview()
 	{
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+		const auto* runtime_interfaces = interfaces::get();
+		if (!runtime_interfaces || !runtime_interfaces->m_engine || !runtime_interfaces->m_engine->is_playing())
+		{
+			// Loading screens, disconnect transitions and the main menu must remain
+			// completely owned by Source. Do not inject fog, markers, lights or FFP
+			// defaults until the engine reports a playable map.
+			return;
+		}
+
+		// Use Source's frame counter when available. The +1 keeps zero reserved as
+		// the explicit "no payload captured" sentinel across map transitions.
+		if (const auto* intf = interfaces::get(); intf && intf->m_globals)
+			main_module::framecount = static_cast<std::uint64_t>(std::max(intf->m_globals->framecount, 0)) + 1u;
+		else
+			++main_module::framecount;
+
+		static_scene_cache::on_frame();
+
 		const auto dev = game::get_d3d_device();
 
 		// helper for nocull markers
@@ -51,27 +79,36 @@ namespace components
 		//choreo_events::on_client_frame();
 		remix_vars::on_client_frame();
 		remix_lights::on_client_frame();
+		dynamic_lighting::on_client_frame();
 		remix_markers::on_client_frame();
+		map_settings::on_frame_autosave();
+		game_settings::on_frame();
 
 		main_module::force_cvars();
 
 		// TODO - find better spot to call this
-		//map_settings::spawn_markers_once();
+		map_settings::spawn_markers_once();
 		// nocull markers handled in 'model_renderer::DrawModelExecute::Detour'
 
-		// CM_PointLeafnum :: get current leaf
-		const auto current_leaf = game::get_leaf_from_position(*game::get_current_view_origin());
-		g_player_leaf_update = g_current_leaf != current_leaf;
-		g_current_leaf = current_leaf;
+		// CM_PointLeafnum :: get current leaf. Do not dereference a transient camera
+		// pointer while the engine is rebuilding its view during map/input transitions.
+		Vector safe_view_origin = {};
+		if (game::get_current_view_origin_safe(safe_view_origin))
+		{
+			const auto current_leaf = game::get_leaf_from_position(safe_view_origin);
+			g_player_leaf_update = g_current_leaf != current_leaf;
+			g_current_leaf = current_leaf;
+		}
 
 		// CM_LeafArea :: get current area the camera is in
-		//g_current_area = utils::hook::call<int(__cdecl)(int leafnum)>(ENGINE_BASE + 0x14C2C0)(g_current_leaf); // #OFFS 2501
-		g_current_area = l4d2::CM_LeafArea(g_current_leaf);
+		g_current_area = l4d2::CM_LeafArea ? l4d2::CM_LeafArea(g_current_leaf) : 0;
 
-		remix_api::get()->on_renderview();
+		if (const auto api = remix_api::get(); api) {
+			api->on_renderview();
+		}
 
 		// fog
-		if (static bool allow_fog = !utils::flags::has_flag("no_fog"); allow_fog)
+		if (static bool allow_fog = !flags::has_flag("no_fog"); allow_fog)
 		{
 			const auto& s = map_settings::get_map_settings();
 			const bool has_dist = s.fog_dist > 0.0f;
@@ -113,53 +150,430 @@ namespace components
 	// ##
 	// ##
 
+	main_module::sky3d_diagnostics_s& main_module::sky3d_diagnostics()
+	{
+		static sky3d_diagnostics_s unavailable = {};
+		return get() ? get()->m_sky3d_diag : unavailable;
+	}
+
+	void main_module::reset_sky3d_diagnostics()
+	{
+		auto& diag = sky3d_diagnostics();
+		const bool installed = diag.hook_installed;
+		const bool logging = diag.rate_limited_logging;
+		const auto generation = get() ? get()->m_sky3d_payload_generation : 0u;
+		const auto payload_frame = get() ? get()->m_sky3d_payload_frame : 0u;
+		const auto hook_payload_frame = get() ? get()->m_sky3d_hook_payload_frame : 0u;
+		const auto payload_signature = get() ? get()->m_sky3d_payload_signature : 0u;
+		const bool hook_confirmed = get() ? get()->m_sky3d_payload_hook_confirmed : false;
+		const Vector origin = get() ? get()->m_sky3d_origin : Vector{};
+		const Vector camera = get() ? get()->m_sky3d_camera_origin : Vector{};
+		const int scale = get() ? get()->m_sky3d_scale : 0;
+		const int area = get() ? get()->m_sky3d_area : -1;
+		diag = {};
+		diag.hook_installed = installed;
+		diag.rate_limited_logging = logging;
+		diag.payload_generation = generation;
+		diag.last_payload_frame = payload_frame;
+		diag.last_valid_payload_frame = payload_frame;
+		diag.last_hook_payload_frame = hook_payload_frame;
+		diag.last_payload_signature = payload_signature;
+		diag.last_payload_hook_confirmed = hook_confirmed;
+		diag.last_origin = origin;
+		diag.last_sky_camera_position = camera;
+		diag.last_scale = scale;
+		diag.last_area = area;
+		diag.last_payload_source = payload_frame ? "current runtime payload" : "none";
+		diag.last_stage = "counters reset";
+	}
+
+	bool main_module::capture_sky3d_payload(const CSkyCamera* sky, const Vector* camera_origin, const char* source)
+	{
+		auto* main = get();
+		if (!main || !sky) return false;
+
+		auto& diag = main->m_sky3d_diag;
+		++diag.sky_camera_found;
+		const Vector origin = sky->m_skyboxData.origin;
+		const int scale = sky->m_skyboxData.scale;
+		const int area = sky->m_skyboxData.area;
+		const std::string_view source_name = source && *source ? source : "unknown";
+		const bool hook_confirmed = source_name.find("SkyboxView::Draw") != std::string_view::npos;
+		const int max_scale = game_settings::get()
+			? std::clamp(game_settings::get()->sky3d_max_scale.get_as<int>(), 1, 65536)
+			: 1024;
+		const bool valid_origin = std::isfinite(origin.x) && std::isfinite(origin.y) && std::isfinite(origin.z);
+		const bool valid_camera_origin = !camera_origin ||
+			(std::isfinite(camera_origin->x) && std::isfinite(camera_origin->y) && std::isfinite(camera_origin->z));
+		const bool valid_scale = scale > 0 && scale <= max_scale;
+		const bool valid_area = area >= -1 && area <= 65535;
+
+		diag.last_origin = origin;
+		diag.last_scale = scale;
+		diag.last_area = area;
+		diag.last_payload_source = std::string(source_name);
+		diag.last_payload_hook_confirmed = hook_confirmed;
+		if (camera_origin && valid_camera_origin)
+		{
+			main->m_sky3d_camera_origin = *camera_origin;
+			diag.last_sky_camera_position = *camera_origin;
+		}
+
+		if (!valid_scale || !valid_origin || !valid_camera_origin || !valid_area)
+		{
+			if (!valid_scale) ++diag.invalid_scale;
+			if (!valid_origin) ++diag.invalid_origin;
+			if (!valid_camera_origin) ++diag.invalid_camera_origin;
+			if (!valid_area) ++diag.invalid_area;
+			if (!valid_scale) diag.last_stage = "sky_camera rejected: invalid or excessive scale";
+			else if (!valid_origin) diag.last_stage = "sky_camera rejected: non-finite origin";
+			else if (!valid_camera_origin) diag.last_stage = "sky_camera rejected: non-finite camera origin";
+			else diag.last_stage = "sky_camera rejected: invalid area";
+			return false;
+		}
+
+		std::uint64_t signature = 14695981039346656037ull;
+		auto mix = [&signature](const void* data, const std::size_t size)
+		{
+			const auto* bytes = static_cast<const std::uint8_t*>(data);
+			for (std::size_t i = 0u; i < size; ++i) signature = (signature ^ bytes[i]) * 1099511628211ull;
+		};
+		mix(&origin.x, sizeof(origin.x));
+		mix(&origin.y, sizeof(origin.y));
+		mix(&origin.z, sizeof(origin.z));
+		mix(&scale, sizeof(scale));
+		mix(&area, sizeof(area));
+		const bool transform_changed = signature != main->m_sky3d_payload_signature;
+
+		main->m_sky3d_origin = origin;
+		main->m_sky3d_scale = scale;
+		main->m_sky3d_area = area;
+		main->m_sky3d_payload_frame = framecount;
+		main->m_sky3d_payload_signature = signature;
+		main->m_sky3d_payload_hook_confirmed = hook_confirmed;
+		if (hook_confirmed)
+		{
+			main->m_sky3d_hook_payload_frame = framecount;
+			main->m_sky3d_hook_payload_signature = signature;
+		}
+		else
+		{
+			++diag.recovery_payloads;
+		}
+
+		if (transform_changed || main->m_sky3d_payload_generation == 0u)
+		{
+			++main->m_sky3d_payload_generation;
+			++diag.payload_transform_changes;
+		}
+		else
+		{
+			++diag.payload_refreshes;
+		}
+
+		++diag.valid_payloads;
+		diag.payload_generation = main->m_sky3d_payload_generation;
+		diag.last_payload_signature = signature;
+		diag.last_payload_frame = framecount;
+		diag.last_valid_payload_frame = framecount;
+		diag.last_hook_payload_frame = main->m_sky3d_hook_payload_frame;
+		diag.last_stage = std::format("valid sky_camera payload captured ({}, {})", diag.last_payload_source,
+			hook_confirmed ? "hook-confirmed" : "recovery-only");
+		return true;
+	}
+
+	void main_module::reset_sky3d_payload(const char* reason)
+	{
+		auto* main = get();
+		if (!main) return;
+		main->m_sky3d_origin.Init();
+		main->m_sky3d_camera_origin.Init();
+		main->m_sky3d_scale = 0;
+		main->m_sky3d_area = -1;
+		main->m_sky3d_payload_frame = 0u;
+		main->m_sky3d_hook_payload_frame = 0u;
+		main->m_sky3d_payload_signature = 0u;
+		main->m_sky3d_hook_payload_signature = 0u;
+		main->m_sky3d_payload_hook_confirmed = false;
+		++main->m_sky3d_payload_generation;
+
+		auto& diag = main->m_sky3d_diag;
+		++diag.payload_resets;
+		diag.payload_generation = main->m_sky3d_payload_generation;
+		diag.last_payload_frame = 0u;
+		diag.last_valid_payload_frame = 0u;
+		diag.last_hook_payload_frame = 0u;
+		diag.last_payload_signature = 0u;
+		diag.last_payload_hook_confirmed = false;
+		diag.last_origin.Init();
+		diag.last_sky_camera_position.Init();
+		diag.last_scale = 0;
+		diag.last_area = -1;
+		diag.last_payload_source = "none";
+		diag.last_stage = std::format("payload reset: {}", reason && *reason ? reason : "unspecified");
+	}
+
+	std::uint64_t main_module::sky3d_payload_age_frames()
+	{
+		const auto* main = get();
+		if (!main || main->m_sky3d_scale <= 0 || main->m_sky3d_payload_frame == 0u) {
+			return std::numeric_limits<std::uint64_t>::max();
+		}
+		return framecount >= main->m_sky3d_payload_frame ? framecount - main->m_sky3d_payload_frame : 0u;
+	}
+
+	bool main_module::sky3d_payload_is_fresh(std::uint64_t max_age_frames)
+	{
+		auto* main = get();
+		if (!main || main->m_sky3d_scale <= 0 || main->m_sky3d_payload_frame == 0u) return false;
+		if (max_age_frames == 0u)
+		{
+			auto* settings = game_settings::get();
+			max_age_frames = settings
+				? static_cast<std::uint64_t>(std::clamp(settings->sky3d_payload_max_age_frames.get_as<int>(), 1, 120))
+				: 8u;
+		}
+		const auto age = sky3d_payload_age_frames();
+		const bool fresh = age <= max_age_frames;
+		if (fresh && age > 0u)
+		{
+			auto& diag = main->m_sky3d_diag;
+			if (diag.last_reuse_note_frame != framecount)
+			{
+				diag.last_reuse_note_frame = framecount;
+				++diag.payload_reused;
+			}
+		}
+		return fresh;
+	}
+
+
+	std::uint64_t main_module::sky3d_hook_payload_age_frames()
+	{
+		const auto* main = get();
+		if (!main || main->m_sky3d_hook_payload_frame == 0u || main->m_sky3d_hook_payload_signature == 0u)
+			return std::numeric_limits<std::uint64_t>::max();
+		return framecount >= main->m_sky3d_hook_payload_frame ? framecount - main->m_sky3d_hook_payload_frame : 0u;
+	}
+
+	bool main_module::sky3d_payload_is_hook_confirmed(std::uint64_t max_age_frames)
+	{
+		const auto* main = get();
+		if (!main || main->m_sky3d_payload_signature == 0u ||
+			main->m_sky3d_payload_signature != main->m_sky3d_hook_payload_signature) return false;
+		if (max_age_frames == 0u)
+		{
+			auto* settings = game_settings::get();
+			max_age_frames = settings
+				? static_cast<std::uint64_t>(std::clamp(settings->sky3d_payload_max_age_frames.get_as<int>(), 1, 120))
+				: 8u;
+		}
+		return sky3d_hook_payload_age_frames() <= max_age_frames;
+	}
+
+	bool main_module::sky3d_payload_is_capture_eligible(std::uint64_t max_age_frames)
+	{
+		if (!sky3d_payload_is_fresh(max_age_frames)) return false;
+		auto* settings = game_settings::get();
+		if (!settings || !settings->sky3d_require_hook_confirmation.get_as<bool>()) return true;
+		return sky3d_payload_is_hook_confirmed(max_age_frames);
+	}
+
+	std::uint64_t main_module::sky3d_payload_signature()
+	{
+		const auto* main = get();
+		return main ? main->m_sky3d_payload_signature : 0u;
+	}
+
+	const char* main_module::sky3d_health_summary()
+	{
+		const auto* main = get();
+		if (!main) return "main module unavailable";
+		const auto& diag = main->m_sky3d_diag;
+		auto* settings = game_settings::get();
+		if (settings && !settings->enable_3d_sky.get_as<bool>()) return "disabled by settings";
+		if (!diag.hook_installed) return "SkyboxView hook not installed";
+		if (diag.view_3dsky_detections == 0u) return "hook active; VIEW_3DSKY not observed";
+		if (diag.sky_camera_found == 0u) return "VIEW_3DSKY observed; sky_camera not found";
+		if (!sky3d_payload_is_fresh()) return "sky_camera payload missing or stale; Source fallback active";
+		if (!sky3d_payload_is_capture_eligible()) return "recovery-only payload; waiting for VIEW_3DSKY hook confirmation";
+		if (diag.static_candidates == 0u) return "eligible payload; no static-scene sky candidates";
+		if (diag.submitted_objects == 0u) return "sky candidates observed; none submitted yet";
+		if (diag.source_draw_suppressed == 0u) return "persistent sky submitted; waiting for resident Source-draw suppression";
+		return "3D skybox payload, persistent submission and Source suppression confirmed";
+	}
+
+	void main_module::note_sky3d_static_candidate()
+	{
+		auto& diag = sky3d_diagnostics();
+		++diag.static_candidates;
+		diag.last_candidate_frame = framecount;
+		diag.last_stage = "3D sky geometry reached static-scene candidate stage";
+	}
+
+	void main_module::note_sky3d_submitted_object()
+	{
+		auto& diag = sky3d_diagnostics();
+		++diag.submitted_objects;
+		diag.last_submission_frame = framecount;
+		diag.last_stage = "3D sky geometry submitted with persistent category";
+	}
+
+	void main_module::note_sky3d_missing_payload()
+	{
+		auto& diag = sky3d_diagnostics();
+		++diag.rejected_missing_payload;
+		diag.last_stage = "static-scene capture rejected: missing valid sky_camera payload";
+	}
+
+	void main_module::note_sky3d_stale_payload()
+	{
+		auto& diag = sky3d_diagnostics();
+		if (diag.last_stale_note_frame == framecount) return;
+		diag.last_stale_note_frame = framecount;
+		++diag.payload_stale;
+		diag.last_stage = "sky_camera payload exceeded freshness window";
+	}
+
+	void main_module::note_sky3d_recovery_rejected()
+	{
+		auto& diag = sky3d_diagnostics();
+		if (diag.last_recovery_reject_note_frame == framecount) return;
+		diag.last_recovery_reject_note_frame = framecount;
+		++diag.recovery_capture_rejected;
+		diag.last_stage = "static-scene capture rejected: payload lacks recent VIEW_3DSKY hook confirmation";
+	}
+
+	void main_module::note_sky3d_safe_fallback()
+	{
+		auto& diag = sky3d_diagnostics();
+		if (diag.last_fallback_note_frame == framecount) return;
+		diag.last_fallback_note_frame = framecount;
+		++diag.safe_fallbacks;
+		diag.last_stage = "safe Source rendering fallback kept for 3D skybox";
+	}
+
+	void main_module::note_sky3d_source_suppressed()
+	{
+		auto& diag = sky3d_diagnostics();
+		++diag.source_draw_suppressed;
+		diag.last_suppressed_frame = framecount;
+		diag.last_stage = "resident 3D sky record suppressed the matching Source draw";
+	}
+
+	std::string main_module::export_runtime_diagnostics()
+	{
+		const std::filesystem::path final_path = std::filesystem::path(game::root_path) / "l4d2-rtx" / "logs" / "runtime_diagnostics_v21_5.txt";
+		const auto temp_path = final_path.string() + ".tmp";
+		std::error_code ec;
+		std::filesystem::create_directories(final_path.parent_path(), ec);
+		std::ofstream out(temp_path, std::ios::out | std::ios::trunc);
+		if (!out.is_open()) return std::format("failed to open {}", temp_path);
+		const auto& sky = sky3d_diagnostics();
+		const auto fl = remix_api::flashlight_runtime_stats();
+		// V21.8.1 runtime diagnostics baseline retained for regression validation.
+		out << "L4D2 RTX Compatibility Mod V21.11 runtime diagnostics\n\n";
+		out << "[sky3d]\n";
+		out << "health = " << sky3d_health_summary() << '\n';
+		out << "stage = " << sky.last_stage << '\n';
+		out << "payload_source = " << sky.last_payload_source << '\n';
+		out << "payload_hook_confirmed = " << (sky.last_payload_hook_confirmed ? "true" : "false") << '\n';
+		out << "payload_signature = " << sky.last_payload_signature << '\n';
+		out << "payload_generation = " << sky.payload_generation << '\n';
+		out << "payload_age_frames = " << sky3d_payload_age_frames() << '\n';
+		out << "hook_payload_age_frames = " << sky3d_hook_payload_age_frames() << '\n';
+		out << "hook_calls = " << sky.hook_calls << '\n';
+		out << "view_3dsky = " << sky.view_3dsky_detections << '\n';
+		out << "valid_payloads = " << sky.valid_payloads << '\n';
+		out << "recovery_payloads = " << sky.recovery_payloads << '\n';
+		out << "recovery_capture_rejected = " << sky.recovery_capture_rejected << '\n';
+		out << "static_candidates = " << sky.static_candidates << '\n';
+		out << "submitted_objects = " << sky.submitted_objects << '\n';
+		out << "source_draw_suppressed = " << sky.source_draw_suppressed << '\n';
+		out << "origin = " << sky.last_origin.x << ' ' << sky.last_origin.y << ' ' << sky.last_origin.z << '\n';
+		out << "scale = " << sky.last_scale << "\narea = " << sky.last_area << "\n\n";
+		out << "[flashlight]\n";
+		out << "tracked_owners = " << fl.tracked_owners << '\n';
+		out << "active_handles = " << fl.active_handles << '\n';
+		out << "requested_layers = " << fl.requested_layers << '\n';
+		out << "granted_layers = " << fl.granted_layers << '\n';
+		out << "transactional_commits = " << fl.transactional_commits << '\n';
+		out << "transactional_rollbacks = " << fl.transactional_rollbacks << '\n';
+		out << "stale_rig_fallbacks = " << fl.stale_rig_fallbacks << '\n';
+		out << "retry_suppressed = " << fl.retry_suppressed << '\n';
+		out << "create_failures = " << fl.create_failures << '\n';
+		out << "draw_failures = " << fl.draw_failures << '\n';
+		out << "invalidated_handles = " << fl.invalidated_handles << '\n';
+		out << "owner_grace_frames_used = " << fl.owner_grace_frames_used << '\n';
+		out.close();
+		if (!out) return "failed while writing runtime diagnostics";
+		const auto temp_w = std::filesystem::path(temp_path).wstring();
+		const auto final_w = final_path.wstring();
+		if (!MoveFileExW(temp_w.c_str(), final_w.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		{
+			std::filesystem::remove(temp_path, ec);
+			return "failed to atomically replace runtime diagnostic report";
+		}
+		return final_path.string();
+	}
+
 	void on_skyboxdraw()
 	{
-		if (game_settings::get()->enable_3d_sky.get_as<bool>())
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+
+		auto* main = main_module::get();
+		if (!main) return;
+		auto& diag = main->m_sky3d_diag;
+		auto* settings = game_settings::get();
+		diag.rate_limited_logging = settings && settings->sky3d_diagnostic_logging.get_as<bool>();
+		++diag.hook_calls;
+		diag.last_view_id = static_cast<std::uint32_t>(game::get_viewid());
+		diag.last_stage = "SkyboxView::Draw hook entered";
+
+		if (game::get_viewid() != VIEW_3DSKY)
 		{
-			// not really req. rn
-			if (game::get_viewid() == VIEW_3DSKY)
+			++diag.hook_non_3d_calls;
+			diag.last_stage = "SkyboxView hook entered outside VIEW_3DSKY";
+			return;
+		}
+
+		++diag.view_3dsky_detections;
+		const Vector camera_origin = l4d2::g_vecCurrentRenderOrigin ? *l4d2::g_vecCurrentRenderOrigin : Vector{};
+		diag.last_stage = "VIEW_3DSKY detected";
+
+		if (!settings || !settings->enable_3d_sky.get_as<bool>())
+		{
+			diag.last_stage = "hook active, feature disabled in settings";
+			return;
+		}
+
+		if (const auto* sky = l4d2::GetCurrentSkyCamera ? l4d2::GetCurrentSkyCamera() : nullptr; sky)
+		{
+			main_module::capture_sky3d_payload(sky, &camera_origin, "SkyboxView::Draw");
+		}
+		else
+		{
+			diag.last_stage = "VIEW_3DSKY observed, sky_camera not found";
+		}
+
+		if (diag.rate_limited_logging)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			if (now - diag.last_log_time >= std::chrono::seconds(2))
 			{
-				const auto vec = *l4d2::g_vecCurrentRenderOrigin; //*reinterpret_cast<Vector*>(CLIENT_BASE + 0x7A52A0);
-				main_module::get()->m_sky3d_camera_origin = vec;
+				diag.last_log_time = now;
+				const auto age = main_module::sky3d_payload_age_frames();
+				game::console();
+				printf("[Sky3D V21.8.1] hook=%llu view=%llu camera=%llu payload=%llu stale=%llu fallback=%llu candidates=%llu submitted=%llu age=%s stage=%s scale=%d origin=(%.1f %.1f %.1f)\n",
+					static_cast<unsigned long long>(diag.hook_calls), static_cast<unsigned long long>(diag.view_3dsky_detections),
+					static_cast<unsigned long long>(diag.sky_camera_found), static_cast<unsigned long long>(diag.valid_payloads),
+					static_cast<unsigned long long>(diag.payload_stale), static_cast<unsigned long long>(diag.safe_fallbacks),
+					static_cast<unsigned long long>(diag.static_candidates), static_cast<unsigned long long>(diag.submitted_objects),
+					age == std::numeric_limits<std::uint64_t>::max() ? "n/a" : utils::va("%llu", static_cast<unsigned long long>(age)),
+					diag.last_stage.c_str(), diag.last_scale, diag.last_origin.x, diag.last_origin.y, diag.last_origin.z);
 			}
-
-			/*
-			auto enginerender = game::get_engine_renderer();
-			const auto dev = game::get_d3d_device();
-
-			auto mat = game::get_material_system();
-			auto ctx = mat->vtbl->GetRenderContext(mat);
-
-
-			VMatrix viewm = {};
-			ctx->vtbl->GetMatrix2(ctx, MATERIAL_VIEW, &viewm);
-			VMatrix worldm = {};
-			ctx->vtbl->GetMatrix2(ctx, MATERIAL_MODEL, &worldm);
-
-			// setup main camera
-			{
-				float colView[4][4] = {};
-				utils::row_major_to_column_major(enginerender->m_matrixView.m[0], colView[0]);
-
-				float colProj[4][4] = {};
-				utils::row_major_to_column_major(enginerender->m_matrixProjection.m[0], colProj[0]);
-
-				auto pos = game::get_current_view_origin();
-				auto render_pos = reinterpret_cast<Vector*>(CLIENT_BASE + 0x7A52A0);
-
-				D3DXMATRIX world =
-				{
-					1.0f, 0.0f, 0.0f, 0.0f,
-					0.0f, 1.0f, 0.0f, 0.0f,
-					0.0f, 0.0f, 1.0f, 0.0f,
-					render_pos->x, render_pos->y, render_pos->z, 1.0f
-				};
-
-				dev->SetTransform(D3DTS_WORLD, &world);
-				dev->SetTransform(D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(colView));
-				dev->SetTransform(D3DTS_PROJECTION, reinterpret_cast<const D3DMATRIX*>(colProj));
-			}*/
 		}
 	}
 
@@ -266,7 +680,7 @@ namespace components
 											std::string str = pmat->vftable->GetName(pmat);
 											const size_t last_slash = str.find_last_of("/\\");
 
-											if (last_slash != std::string::npos) 
+											if (last_slash != std::string::npos)
 											{
 												playermodel_substr = str.substr(0, last_slash + 1);
 												found_valid_material = true;
@@ -292,16 +706,16 @@ namespace components
 							const auto& up = entity->read<Vector>(0x1128);
 							remix_api::get()->flashlight_create_or_update(info.name, eyepos, fwd, rt, up, flashlight_enabled, true);
 
-							// not really required rn.
-							if (game_settings::get()->enable_3d_sky.get_as<bool>())
+							// Safe recovery path: when the SkyboxView hook has not produced a fresh
+							// payload yet, entity iteration may refresh sky_camera metadata. It does
+							// not force static capture and therefore cannot hide Source geometry.
+							if (game_settings::get()->enable_3d_sky.get_as<bool>() &&
+								game_settings::get()->sky3d_safe_source_fallback.get_as<bool>() &&
+								!main_module::sky3d_payload_is_fresh())
 							{
-								// GetCurrentSkyCamera #OFFS
-								if (const auto sky = l4d2::GetCurrentSkyCamera(); //utils::hook::call<CSkyCamera * (__cdecl)()>(SERVER_BASE + 0x1D0D10)();
-									sky)
+								if (const auto* sky = l4d2::GetCurrentSkyCamera ? l4d2::GetCurrentSkyCamera() : nullptr; sky)
 								{
-									const auto main = get();
-									main->m_sky3d_origin = sky->m_skyboxData.origin;
-									main->m_sky3d_scale = sky->m_skyboxData.scale;
+									main_module::capture_sky3d_payload(sky, nullptr, "entity iteration fallback");
 								}
 							}
 						}
@@ -312,7 +726,7 @@ namespace components
 							const bool flashlight_enabled = m_fEffects & 4;
 
 							const auto& eyepos = entity->get_eye_pos();
-							const auto& angles = entity->read<Vector>(0x196C); // m_angEyeAngles[0] - DT_CSPlayer 
+							const auto& angles = entity->read<Vector>(0x196C); // m_angEyeAngles[0] - DT_CSPlayer
 
 							Vector fwd, rt, up;
 							utils::vector::AngleVectors(angles, &fwd, &rt, &up);
@@ -326,14 +740,17 @@ namespace components
 			}
 		}
 
-		// check if all flashlights were found
-		// remix_api::flashlight_frame() resets is_alive on each frame and
-		// remix_api::flashlight_create_or_update() sets is_alive if the entity was found
-		// > disable light if is_alive is still false at this point because the player/npc might have died or disconnected
-		for (auto& fl : remix_api::get()->m_flashlights)
+		// Compatibility lifecycle restored from V20.9: flashlight_frame() marks every
+		// owner unseen after rebuilding the current frame, while entity iteration marks
+		// owners that still exist. A missing/dead/disconnected owner is disabled before
+		// the next frame rebuild, matching the original working behaviour.
+		if (remix_api::is_initialized())
 		{
-			if (!fl.second.is_alive) {
-				fl.second.is_enabled = false;
+			for (auto& [name, flashlight] : remix_api::get()->m_flashlights)
+			{
+				if (!flashlight.is_alive) {
+					flashlight.is_enabled = false;
+				}
 			}
 		}
 	}
@@ -445,9 +862,27 @@ namespace components
 	// Return 0 to NOT cull the node
 	int r_cullnode_wrapper(mnode_t* node)
 	{
-		if (game::get_viewid() == VIEW_3DSKY || game::get_viewid() == VIEW_MONITOR) {
-			return l4d2::R_CullNode(node); // return utils::hook::call<bool(__cdecl)(mnode_t*)>(ENGINE_BASE + 0xFC490)(node); // #OFFS 2501
-			
+		const auto view = game::get_viewid();
+		if (view == VIEW_MONITOR) {
+			return l4d2::R_CullNode ? l4d2::R_CullNode(node) : false;
+		}
+
+		// Full Resident capture deliberately exposes the complete BSP to the fixed-function
+		// bridge for a short capture window. This is not a per-frame resident culling mode.
+		if (static_scene_cache::requires_full_visibility_capture() &&
+			full_resident_world_data_sane(game::get_hoststate_worldbrush_data()))
+		{
+			if (view == VIEW_MAIN) {
+				return 0;
+			}
+			if (view == VIEW_3DSKY && static_scene_cache::sky3d_fusion_enabled() &&
+				g_full_resident_sky_capture_nodes.contains(node)) {
+				return 0;
+			}
+		}
+
+		if (view == VIEW_3DSKY) {
+			return l4d2::R_CullNode ? l4d2::R_CullNode(node) : false;
 		}
 
 		// default culling mode or no culling if cmd was used
@@ -534,7 +969,7 @@ namespace components
 		}
 
 		// if no area override or if cull mode is distance based
-		if (   !g_player_current_area_override 
+		if (   !g_player_current_area_override
 			|| using_distance_based_mode)
 		{
 			if (is_aabb_within_distance(node->m_vecCenter, node->m_vecHalfDiagonal, *game::get_current_view_origin(), nocull_dist)) {
@@ -561,8 +996,7 @@ namespace components
 		}
 
 		// R_CullNode - uses area frustums if avail. and not in a solid - uses player frustum otherwise
-		//if (!utils::hook::call<bool(__cdecl)(mnode_t*)>(l4d2::fn_addr__r_cullnode)(node)) {
-		if (!l4d2::R_CullNode(node)) {
+		if (!l4d2::R_CullNode || !l4d2::R_CullNode(node)) {
 			return 0;
 		}
 
@@ -585,7 +1019,7 @@ namespace components
 				for (const auto& lt : g_player_current_area_override->leaf_tweaks)
 				{
 					// check if node the player is currently in has any overrides
-					if (lt.in_leafs.contains(g_current_leaf)) 
+					if (lt.in_leafs.contains(g_current_leaf))
 					{
 						// if so, check if the current node to be culled is part of a forced area
 						// note: areas are not vis forced - this only disables frustum culling and relies on PVS
@@ -685,7 +1119,68 @@ namespace components
 
 	void pre_recursive_world_node()
 	{
-		if (game::get_viewid() == VIEW_3DSKY || game::get_viewid() == VIEW_MONITOR) {
+		const auto view = game::get_viewid();
+		if (view == VIEW_MONITOR) {
+			return;
+		}
+
+		const auto world = game::get_hoststate_worldbrush_data();
+		if (!world) {
+			return;
+		}
+
+		g_full_resident_sky_capture_nodes.clear();
+		if (static_scene_cache::requires_full_visibility_capture())
+		{
+			if (!full_resident_world_data_sane(world))
+			{
+				static bool warned_invalid_world = false;
+				if (!warned_invalid_world)
+				{
+					warned_invalid_world = true;
+					game::console();
+					printf("[STATIC SCENE] Full-BSP capture deferred: invalid/incomplete worldbrushdata.\n");
+				}
+				return;
+			}
+			const auto visframe = game::get_visframecount();
+			if (view == VIEW_MAIN)
+			{
+				for (auto i = 0; i < world->numnodes; ++i) {
+					world->nodes[i].visframe = visframe;
+				}
+				for (auto i = 0; i < world->numleafs; ++i) {
+					world->leafs[i].visframe = visframe;
+				}
+			}
+			else if (view == VIEW_3DSKY && static_scene_cache::sky3d_fusion_enabled())
+			{
+				const auto sky_area = main_module::get()->m_sky3d_area;
+				if (sky_area >= 0)
+				{
+					for (auto i = 0; i < world->numleafs; ++i)
+					{
+						auto* leaf = &world->leafs[i];
+						if (leaf->area != sky_area) {
+							continue;
+						}
+
+						leaf->visframe = visframe;
+						g_full_resident_sky_capture_nodes.insert(reinterpret_cast<mnode_t*>(leaf));
+						std::uint32_t parent_steps = 0u;
+						const auto parent_limit = static_cast<std::uint32_t>(world->numnodes + world->numleafs);
+						for (auto* parent = leaf->parent; parent && parent_steps < parent_limit;
+							parent = parent->parent, ++parent_steps)
+						{
+							parent->visframe = visframe;
+							g_full_resident_sky_capture_nodes.insert(parent);
+						}
+					}
+				}
+			}
+		}
+
+		if (view == VIEW_3DSKY) {
 			return;
 		}
 
@@ -693,7 +1188,6 @@ namespace components
 		main_module::get()->m_hud_debug_node_vis_has_forced_leafs = false;
 		main_module::get()->m_hud_debug_node_vis_has_forced_arealeafs = false;
 
-		const auto world = game::get_hoststate_worldbrush_data();
 		auto& map_settings = map_settings::get_map_settings();
 
 		// visualize current leaf + forced leafs (map_settings)
@@ -714,11 +1208,11 @@ namespace components
 							break;
 						}
 
-						if (const auto	forced_leaf = &world->leafs[l]; 
+						if (const auto	forced_leaf = &world->leafs[l];
 										forced_leaf != curr_leaf)
 						{
 							// visualize near-by leaf overrides (TEAL)
-							if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 2000.0f * 2000.0f) 
+							if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 2000.0f * 2000.0f)
 							{
 								remix_api::get()->debug_draw_box(forced_leaf->m_vecCenter, forced_leaf->m_vecHalfDiagonal, 3.5f, remix_api::DEBUG_REMIX_LINE_COLOR::TEAL);
 								main_module::get()->m_hud_debug_node_vis_has_forced_leafs = true;
@@ -736,10 +1230,10 @@ namespace components
 							}
 
 							// visualize near-by leafs that are part of area overrides (RED)
-							if (const auto	forced_leaf = &world->leafs[i]; 
+							if (const auto	forced_leaf = &world->leafs[i];
 											forced_leaf != curr_leaf && a == (std::uint32_t)forced_leaf->area)
 							{
-								if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 350.0f * 350.0f) 
+								if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 350.0f * 350.0f)
 								{
 									remix_api::get()->debug_draw_box(forced_leaf->m_vecCenter, forced_leaf->m_vecHalfDiagonal, 3.5f, remix_api::DEBUG_REMIX_LINE_COLOR::RED);
 									main_module::get()->m_hud_debug_node_vis_has_forced_arealeafs = true;
@@ -763,7 +1257,7 @@ namespace components
 								if (const auto	forced_leaf = &world->leafs[i];
 									forced_leaf != curr_leaf && lt.areas.contains((std::uint32_t)forced_leaf->area))
 								{
-									if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 350.0f * 350.0f) 
+									if (game::get_current_view_origin()->DistToSqr(forced_leaf->m_vecCenter) < 350.0f * 350.0f)
 									{
 										remix_api::get()->debug_draw_box(forced_leaf->m_vecCenter, forced_leaf->m_vecHalfDiagonal, 3.5f, remix_api::DEBUG_REMIX_LINE_COLOR::RED);
 										main_module::get()->m_hud_debug_node_vis_has_forced_arealeafs = true;
@@ -980,15 +1474,15 @@ namespace components
 			}
 		}
 #if 0
-		for (auto i = 0; i < world->numleafs; i++) 
+		for (auto i = 0; i < world->numleafs; i++)
 		{
 			// leaf forcing test of disp
-			if (i == 3152 || i == 3136) 
+			if (i == 3152 || i == 3136)
 			{
 				force_leaf_vis(i);
-			} 
+			}
 
-			if (i == 3174) 
+			if (i == 3174)
 			{
 				int x = 1;
 			}
@@ -1147,7 +1641,7 @@ namespace components
 
 				// og
 				mov     cl, 1;
-				test	[ebx + 0x24], cl;
+				test[ebx + 0x24], cl;
 				jmp		impact_og_retn;
 
 			SKIP:
@@ -1168,14 +1662,26 @@ namespace components
 	 */
 	void on_map_load_hk(const char* map_name)
 	{
-		main_module::get()->m_sky3d_origin.Init();
-		main_module::get()->m_sky3d_camera_origin.Init();
-		main_module::get()->m_sky3d_scale = 0;
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+
+		static_scene_cache::on_map_load(map_name);
+
+		main_module::reset_sky3d_payload("map load");
+		remix_api::clear_flashlights();
+		g_full_resident_sky_capture_nodes.clear();
 		main_module::get()->m_playermodel_substr.clear();
+
+		// Keep the Event Workbench focused on the current map/session.
+		sound_events::clear_history();
+		choreo_events::clear_history();
 
 		imgui::on_map_load();
 		remix_vars::on_map_load();
 		remix_lights::on_map_load();
+		dynamic_lighting::on_map_load(map_name);
+		material_exporter::on_map_load(map_name);
 		map_settings::on_map_load(map_name);
 		main_module::force_cvars();
 
@@ -1252,13 +1758,24 @@ namespace components
 	 */
 	void on_host_disconnect_hk()
 	{
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+
+		static_scene_cache::on_map_unload();
+		main_module::reset_sky3d_payload("host disconnect");
+		remix_api::clear_flashlights();
+
 		//choreo_events::reset_all();
 		main_module::trigger_vis_logic();
 
 		// ----------
 
 		map_settings::on_map_unload();
+
+		// Reset transient per-map variables without synchronous rtx.conf disk parsing.
 		remix_vars::on_map_unload();
+		main_module::framecount = 0u;
 	}
 
 	HOOK_RETN_PLACE_DEF(on_host_disconnect_retn);
@@ -1350,19 +1867,34 @@ namespace components
 		game::cvar_uncheat_and_set_int("r_WaterDrawRefraction", 0); // fix weird culling behaviour near water surfaces
 		game::cvar_uncheat_and_set_int("r_WaterDrawReflection", 0); // perf?
 
-		game::cvar_uncheat_and_set_int("r_threaded_particles", 0);
+		// Source renderer threading is intentionally forced to the safe single-threaded path by default.
+		// mat_queue_mode -1/2 can improve CPU-side performance, but queued rendering can break Remix capture order
+		// and cause one-frame disappearing geometry. Mode 1 is a safer hybrid: no queued renderer, only optional
+		// non-render worker cvars. Modes 2-4 are explicit A/B tests with selectable flicker mitigations.
+		const int source_threading_mode = std::clamp(game_settings::get()->source_threading_mode.get_as<int>(), 0, 4);
+		const int source_flicker_mitigation = std::clamp(game_settings::get()->source_queue_flicker_mitigation.get_as<int>(), 0, 2);
+		const bool source_threading_experimental = source_threading_mode != 0;
+		const bool source_queued_renderer = source_threading_mode >= 2;
+		const bool source_geometry_quarantine = source_queued_renderer && game_settings::get()->source_queue_geometry_quarantine.get_as<bool>();
+		const bool source_strict_flicker_guard = source_queued_renderer && source_flicker_mitigation >= 2;
+		const int mat_queue_mode = source_threading_mode >= 3 ? 2 : source_threading_mode == 2 ? -1 : 0;
+		const bool allow_threaded_particles = source_threading_experimental && game_settings::get()->source_threaded_particles.get_as<bool>() && !source_strict_flicker_guard;
+
+		game::cvar_uncheat_and_set_int("r_threaded_particles", allow_threaded_particles ? 1 : 0);
 		game::cvar_uncheat_and_set_int("r_entityclips", 0);
 		game::cvar_uncheat_and_set_int("r_PortalTestEnts", 0);
 
 		game::cvar_uncheat_and_set_int("cl_fastdetailsprites", 0);
 		game::cvar_uncheat_and_set_int("cl_brushfastpath", 0);
-		game::cvar_uncheat_and_set_int("cl_tlucfastpath", 0); // 
+		game::cvar_uncheat_and_set_int("cl_tlucfastpath", 0); //
 		game::cvar_uncheat_and_set_int("cl_modelfastpath", 0); // gain 4-5 fps on some act 4 maps but FF rendering not implemented
-		game::cvar_uncheat_and_set_int("mat_queue_mode", 0); // does improve performance but breaks rendering
-		game::cvar_uncheat_and_set_int("r_queued_ropes", 0);
+		game::cvar_uncheat_and_set_int("mat_queue_mode", mat_queue_mode);
+		game::cvar_uncheat_and_set_int("r_queued_ropes", source_threading_experimental && game_settings::get()->source_queued_ropes.get_as<bool>() && !source_geometry_quarantine ? 1 : 0);
 		game::cvar_uncheat_and_set_int("mat_softwarelighting", 0);
 		game::cvar_uncheat_and_set_int("mat_parallaxmap", 0);
-		game::cvar_uncheat_and_set_int("mat_frame_sync_enable", 0);
+		game::cvar_uncheat_and_set_int("mat_frame_sync_enable", source_queued_renderer && (game_settings::get()->source_queue_frame_sync_guard.get_as<bool>() || source_flicker_mitigation >= 1) ? 1 : 0);
+		game::cvar_uncheat_and_set_int("mat_forcehardwaresync", source_strict_flicker_guard ? 1 : 0);
+		game::cvar_uncheat_and_set_int("mat_forcemanagedtextureintohardware", source_strict_flicker_guard ? 1 : 0);
 		game::cvar_uncheat_and_set_int("mat_dof_enabled", 0);
 		game::cvar_uncheat_and_set_int("mat_displacementmap", 0);
 		game::cvar_uncheat_and_set_int("mat_drawflat", 0);
@@ -1380,14 +1912,14 @@ namespace components
 		game::cvar_uncheat_and_set_int("mat_fastnobump", 1);
 		game::cvar_uncheat_and_set_int("mat_disable_bloom", 1);
 
-		game::cvar_uncheat_and_set_int("r_threadeddetailprops", 0);
+		game::cvar_uncheat_and_set_int("r_threadeddetailprops", source_threading_experimental && game_settings::get()->source_threaded_detailprops.get_as<bool>() && !source_geometry_quarantine ? 1 : 0);
 		game::cvar_uncheat_and_set_int("r_DrawDetailProps", 0); // disables grass (detail) sprites on displacements (unstable and blurry)
 
 
 		// TODO: HACK
 		// remove when displacement-backface culling check is found - currently in use so that
 		// displacements are rendered when leaf is forced
-		game::cvar_uncheat_and_set_int("r_DispWalkable", 1); 
+		game::cvar_uncheat_and_set_int("r_DispWalkable", 1);
 
 
 		// graphic settings
@@ -1395,7 +1927,7 @@ namespace components
 		// lvl 0
 		game::cvar_uncheat_and_set_int("cl_particle_fallback_base", 0);//3); // 0 = render portalgun viewmodel effects
 		game::cvar_uncheat_and_set_int("cl_particle_fallback_multiplier", 1); //2);
-		
+
 		game::cvar_uncheat_and_set_int("cl_impacteffects_limit_general", 10);
 		game::cvar_uncheat_and_set_int("cl_impacteffects_limit_exit", 3);
 		game::cvar_uncheat_and_set_int("cl_impacteffects_limit_water", 2);
@@ -1448,6 +1980,11 @@ namespace components
 	{
 		p_this = this;
 
+		{ // init filepath var
+			char path[MAX_PATH]; GetModuleFileNameA(nullptr, path, MAX_PATH);
+			game::root_path = path; utils::erase_substring(game::root_path, "left4dead2.exe");
+		}
+
 		{ // init d3d font
 			D3DXFONT_DESC desc =
 			{
@@ -1491,6 +2028,8 @@ namespace components
 		utils::hook::nop(l4d2::hk_addr__skyboxview_draw_internal, 7);
 		utils::hook(l4d2::hk_addr__skyboxview_draw_internal, skyboxview_draw_internal_stub).install()->quick();
 		HOOK_RETN_PLACE(skyboxview_draw_internal_retn, l4d2::hk_addr__skyboxview_draw_internal + 7u);
+		m_sky3d_diag.hook_installed = true;
+		m_sky3d_diag.last_stage = "SkyboxView::Draw hook installed";
 
 		// #
 		// culling
@@ -1500,7 +2039,7 @@ namespace components
 
 #if USE_BUILD_WORLD_LIST_NOCULL
 		// R_RecursiveWorldNodeNoCull:: use 'R_BuildWorldListNoCull' instead of 'R_RecursiveWorldNode'
-		utils::hook::nop(ENGINE_BASE + 0xD162D, 2); // THIS will not render bullet holes on bsp? 
+		utils::hook::nop(ENGINE_BASE + 0xD162D, 2); // THIS will not render bullet holes on bsp?
 
 		// stub before calling 'R_RecursiveWorldNode' to override node/leaf vis
 		utils::hook::nop(ENGINE_BASE + 0xD1635, 9);
@@ -1536,7 +2075,7 @@ namespace components
 		utils::hook::set<BYTE>(l4d2::nop_addr__cullnode_backface_check02, 0x74); // ^
 
 		// R_DrawLeaf :: backface check (emissive lamps) plane normal >= -0.00999f
-		utils::hook::nop(l4d2::nop_addr__drawleaf_backface_check, 6); // ^ 
+		utils::hook::nop(l4d2::nop_addr__drawleaf_backface_check, 6); // ^
 #endif
 
 		// CBrushBatchRender::DrawOpaqueBrushModel :: :: backface check - nop 'if ( bShadowDepth )' to disable culling
@@ -1544,7 +2083,7 @@ namespace components
 
 		// CClientLeafSystem::ExtractCulledRenderables :: disable 'engine->CullBox' check to disable entity culling in leafs
 		// needs r_PortalTestEnts to be 0 -> je to jmp (0xEB)
-		utils::hook::conditional_jump_to_jmp(l4d2::jmp_addr__extract_culled_renderables);
+		utils::hook::set<BYTE>(l4d2::jmp_addr__extract_culled_renderables, 0xEB);
 
 		// ~ always show geometry below water surface
 		// CSimpleWorldView::Setup :: nop 'DoesViewPlaneIntersectWater' check
@@ -1557,10 +2096,10 @@ namespace components
 		// ---------------
 		// # player shadow
 
-		if (g_use_playershadow = !utils::flags::has_flag("disable_playershadow"); g_use_playershadow)
+		if (g_use_playershadow = !flags::has_flag("disable_playershadow"); g_use_playershadow)
 		{
 			// helper var around C_BasePlayer_Draw so we know when we are drawing our player mesh
-			// we wrap around each of the three initial checks because we do not want to tag the player body 
+			// we wrap around each of the three initial checks because we do not want to tag the player body
 			// if the game is rendering in third person or when doing intro cinematics
 
 			// GetLocalPlayer check
@@ -1580,27 +2119,17 @@ namespace components
 			// reset helper var after drawing
 			utils::hook(l4d2::retn_addr__draw_player_thirdperson_mesh + 18u, playershadow::post_draw_player_thirdperson_mesh_stub, HOOK_JUMP).install()->quick();
 
-			// 
+			//
 			// F890E disable impact marks on ourselfs
-			utils::hook(l4d2::hk_addr__impact_marks_pshadow, playershadow::impact_stub, HOOK_JUMP).install()->quick(); // 0726 offs changed
+			utils::hook(l4d2::hk_addr__impact_marks_pshadow, playershadow::impact_stub, HOOK_JUMP).install()->quick();
 			HOOK_RETN_PLACE(playershadow::impact_og_retn, l4d2::hk_addr__impact_marks_pshadow + 5u);
 			HOOK_RETN_PLACE(playershadow::impact_skip_retn, l4d2::retn_addr__impact_marks_pshadow_skip);
 		}
-
-		// ---------------
-		// misc
-
-		// disable "SURVIVORBOT .. will not help incap .. UNREACHABLE via NAV" log spam
-		utils::hook::nop(l4d2::nop_addr__unreachable_nav_msg_print, 6);
-
 
 		// #
 		// commands
 
 		game::con_add_command(&xo_debug_toggle_node_vis_cmd, "xo_debug_toggle_node_vis", xo_debug_toggle_node_vis_fn, "Toggle bsp node/leaf debug visualization using the remix api");
-
-		m_initialized = true;
-		log("MainModule", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
 	}
 
 	main_module::~main_module()

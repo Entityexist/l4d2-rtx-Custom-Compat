@@ -1,0 +1,57 @@
+V21.14.10 supplied binary pattern audit
+
+Total patterns: 51
+Unique matches: 51
+RVA matches against project baseline: 51
+
+engine.dll           hoststate_worldbrush_data_ptr                        matches=1 rva=0x5db53 baseline=0x5db53 delta=0
+engine.dll           current_view_origin                                  matches=1 rva=0xb9843 baseline=0xb9843 delta=0
+engine.dll           current_view_forward                                 matches=1 rva=0xc3de9 baseline=0xc3de9 delta=0
+engine.dll           visframecount                                        matches=1 rva=0xcd65a baseline=0xcd65a delta=0
+engine.dll           R_CullNode                                           matches=1 rva=0xfc490 baseline=0xfc490 delta=0
+engine.dll           CM_LeafArea                                          matches=1 rva=0x14c2c0 baseline=0x14c2c0 delta=0
+engine.dll           hk_addr__on_map_load                                 matches=1 rva=0xee05c baseline=0xee05c delta=0
+engine.dll           hk_addr__on_host_disconnect                          matches=1 rva=0x192f11 baseline=0x192f11 delta=0
+engine.dll           hk_addr__on_host_change_level                        matches=1 rva=0x18d048 baseline=0x18d048 delta=0
+engine.dll           nop_addr__cdispinfo_render                           matches=1 rva=0xb13e5 baseline=0xb13e5 delta=0
+engine.dll           hk_addr__pre_recursive_world_node                    matches=1 rva=0xd1648 baseline=0xd1648 delta=0
+engine.dll           jmp_addr__cullnode01                                 matches=1 rva=0xcd7e5 baseline=0xcd7e5 delta=0
+engine.dll           retn_addr__cullnode_cull                             matches=1 rva=0xcd935 baseline=0xcd935 delta=0
+engine.dll           retn_addr__cullnode_skip                             matches=1 rva=0xcd7f8 baseline=0xcd7f8 delta=0
+engine.dll           nop_addr__cullnode_backface_check01                  matches=1 rva=0xcd8c1 baseline=0xcd8c1 delta=0
+engine.dll           nop_addr__cullnode_backface_check02                  matches=1 rva=0xcd8cb baseline=0xcd8cb delta=0
+engine.dll           nop_addr__drawleaf_backface_check                    matches=1 rva=0xcd4e7 baseline=0xcd4e7 delta=0
+engine.dll           nop_addr__draw_opaque_bmodel_backface_check          matches=1 rva=0xd2250 baseline=0xd2250 delta=0
+engine.dll           fn_addr__point_leafnum                               matches=1 rva=0x14b130 baseline=0x14b130 delta=0
+client.dll           g_vecCurrentRenderOrigin                             matches=1 rva=0x1ccf5a baseline=0x1ccf5a delta=0
+client.dll           s_viewFadeColor                                      matches=1 rva=0x1c44f3 baseline=0x1c44f3 delta=0
+client.dll           material_system_ptr                                  matches=1 rva=0x11b76 baseline=0x11b76 delta=0
+client.dll           modelinfo_ptr                                        matches=1 rva=0x19236 baseline=0x19236 delta=0
+client.dll           camera_forward_vector                                matches=1 rva=0x1bab58 baseline=0x1bab58 delta=0
+client.dll           viewid                                               matches=1 rva=0x1ccfcc baseline=0x1ccfcc delta=0
+client.dll           hk_addr__cviewrenderer_renderview                    matches=1 rva=0x1d7113 baseline=0x1d7113 delta=0
+client.dll           hk_addr__skyboxview_draw_internal                    matches=1 rva=0x1d3f1d baseline=0x1d3f1d delta=0
+client.dll           jmp_addr__extract_culled_renderables                 matches=1 rva=0xbda76 baseline=0xbda76 delta=0
+client.dll           nop_addr__simple_world_view_intersect_water_check    matches=1 rva=0x1cf46f baseline=0x1cf46f delta=0
+client.dll           hk_addr__draw_player_thirdperson_mesh_check01        matches=1 rva=0x223371 baseline=0x223371 delta=0
+client.dll           hk_addr__draw_player_thirdperson_mesh_check02        matches=1 rva=0x223387 baseline=0x223387 delta=0
+client.dll           hk_addr__draw_player_thirdperson_mesh_check03        matches=1 rva=0x22339f baseline=0x22339f delta=0
+client.dll           retn_addr__draw_player_thirdperson_mesh              matches=1 rva=0x22341f baseline=0x22341f delta=0
+client.dll           hk_addr__impact_marks_pshadow                        matches=1 rva=0xf894e baseline=0xf894e delta=0
+client.dll           hk_addr__render_spritecard_new                       matches=1 rva=0x3c9f1f baseline=0x3c9f1f delta=0
+client.dll           hk_addr__rope_mgr_draw_render_cache                  matches=1 rva=0x93a3d baseline=0x93a3d delta=0
+client.dll           hk_addr__glow_overlay_draw                           matches=1 rva=0x1080c0 baseline=0x1080c0 delta=0
+client.dll           nop_addr__func_area_portal_window_draw_mdl           matches=1 rva=0x7690e baseline=0x7690e delta=0
+client.dll           fn_addr__add_console_cmd                             matches=1 rva=0x3d36f0 baseline=0x3d36f0 delta=0
+client.dll           fn_addr__get_bone_transform                          matches=1 rva=0x331c0 baseline=0x331c0 delta=0
+client.dll           fn_addr__get_model_ptr                               matches=1 rva=0x2140 baseline=0x2140 delta=0
+shaderapidx9.dll     d3d_device_ptr                                       matches=1 rva=0x5e5c baseline=0x5e5c delta=0
+shaderapidx9.dll     shaderapi_ptr                                        matches=1 rva=0x6870 baseline=0x6870 delta=0
+shaderapidx9.dll     kh_addr__cmeshdx8_renderpass_pre_draw                matches=1 rva=0xbefa baseline=0xbefa delta=0
+shaderapidx9.dll     kh_addr__cmeshdx8_renderpass_post_draw               matches=1 rva=0xc05a baseline=0xc05a delta=0
+studiorender.dll     hk_addr__studio_draw_static_mesh                     matches=1 rva=0xef7b baseline=0xef7b delta=0
+engine.dll           engine_renderer                                      matches=1 rva=0xaa3b2 baseline=0xaa3b2 delta=0
+engine.dll           hk_addr__start_sound                                 matches=1 rva=0x1c0b6 baseline=0x1c0b6 delta=0
+engine.dll           fn_addr__debug_overlay_add_text                      matches=1 rva=0x1c004 baseline=0x1c004 delta=0
+engine.dll           fn_addr__debug_overlay_add_text_colored              matches=1 rva=0xdb33f baseline=0xdb33f delta=0
+client.dll           fn_addr__lookup_bone                                 matches=1 rva=0x8d902 baseline=0x8d902 delta=0

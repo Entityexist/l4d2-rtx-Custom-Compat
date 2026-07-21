@@ -1,0 +1,10 @@
+V21.14.10 crash dump audit
+
+Exception code: 0xC0000005 (execute access violation)
+Fault address: 0x7265706F
+Fault address ASCII little-endian: oper
+Faulting thread: 35184
+EIP: 0x7265706F
+EDX call target: 0x7265706F
+
+The target is outside every loaded module. The MMB timing and engine trace stack are consistent with the old EngineTraceClient003 slot-4 dispatch treating the trace filter as an ICollideable. V21.14.10 uses audited slot 5 and validates the target module.

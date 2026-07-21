@@ -1,0 +1,118 @@
+version = 6
+# Example only. The runtime writes one file with the current BSP name to:
+# l4d2-rtx/map_lights/<map>.toml
+
+# Static Source/BSP light. Once present, the delayed BSP importer will not
+# create a duplicate for source_index 12.
+[[light]]
+persistent_id = "source_12"
+full_rig = true
+source_index = 12
+classname = "light_spot"
+group = "Persistent Source map lights"
+comment = "Warehouse ceiling spotlight"
+source_kind = "bsp_spotlight"
+enabled = true
+loop = false
+
+[[light.point]]
+position = [384.0, -128.0, 192.0]
+color = [1.0, 0.82, 0.62]
+radiance_scalar = 18.0
+radius = 1.25
+timepoint = 0.0
+smoothness = 0.5
+use_shaping = true
+direction = [0.0, 0.0, -1.0]
+degrees = 55.0
+softness = 0.25
+exponent = 2.0
+volumetric_scale = 1.0
+authoring_shape = 2
+light_rig_mode = 0
+
+# Live-linked Source entity. It is visible in Light Rigging but is not spawned
+# as a second static light; Source still owns movement and on/off state.
+[[light]]
+persistent_id = "runtime_145_env_projectedtexture"
+full_rig = true
+runtime_entity_index = 145
+runtime_kind = "env_projectedtexture"
+classname = "env_projectedtexture"
+source_kind = "env_projectedtexture"
+source_live_link = true
+group = "Imported runtime map lights"
+comment = "Moving searchlight"
+enabled = true
+
+[[light.point]]
+position = [0.0, 0.0, 0.0]
+color = [0.75, 0.85, 1.0]
+radiance_scalar = 10.0
+radius = 0.75
+timepoint = 0.0
+smoothness = 0.5
+use_shaping = true
+direction = [1.0, 0.0, 0.0]
+degrees = 42.0
+softness = 0.18
+exponent = 1.0
+volumetric_scale = 1.0
+authoring_shape = 2
+light_rig_mode = 1
+ies_file = "rtx-remix/ies/searchlight.ies"
+ies_axis_rotation = 0.0
+ies_angle_scale = 1.0
+ies_intensity_scale = 1.0
+ies_normalize = true
+
+# Authored animated Light Rig with two points.
+[[light]]
+persistent_id = "user_7f7c5f7725ee19a4"
+full_rig = true
+group = "Authored map lights"
+comment = "Red emergency pulse"
+enabled = true
+run_once = false
+loop = true
+loop_smoothing = true
+
+[[light.point]]
+position = [256.0, 64.0, 96.0]
+color = [1.0, 0.04, 0.02]
+radiance_scalar = 2.0
+radius = 0.35
+timepoint = 0.0
+smoothness = 0.8
+use_shaping = false
+direction = [0.0, 0.0, 1.0]
+degrees = 180.0
+softness = 0.0
+exponent = 0.0
+volumetric_scale = 1.0
+authoring_shape = 1
+light_rig_mode = 0
+
+[[light.point]]
+position = [256.0, 64.0, 96.0]
+color = [1.0, 0.04, 0.02]
+radiance_scalar = 14.0
+radius = 0.55
+timepoint = 0.5
+smoothness = 0.8
+use_shaping = false
+direction = [0.0, 0.0, 1.0]
+degrees = 180.0
+softness = 0.0
+exponent = 0.0
+volumetric_scale = 1.0
+authoring_shape = 1
+light_rig_mode = 0
+
+# Tombstone. The corresponding Source/base light remains deleted after reload.
+[[light]]
+persistent_id = "source_44"
+full_rig = true
+deleted = true
+source_index = 44
+enabled = false

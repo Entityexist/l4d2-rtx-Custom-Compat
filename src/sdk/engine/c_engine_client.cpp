@@ -47,6 +47,12 @@ namespace sdk
 		using original_fn = const char*(__thiscall*)(engine_client*);
 		return (*(original_fn * *)this)[53](this);
 	}
+
+	float engine_client::light_style_value(const int style)
+	{
+		using original_fn = float(__thiscall*)(engine_client*, int);
+		return (*reinterpret_cast<original_fn**>(this))[46](this, style);
+	}
 	
 	bool engine_client::is_console_visible()
 	{

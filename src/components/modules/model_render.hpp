@@ -24,130 +24,6 @@ namespace components
 		}
 	}
 
-	enum class RemixModifier : std::uint16_t
-	{
-		None = 0,
-		InfectedShader = 1 << 0,
-		EmissiveScalar = 1 << 1,
-		Free02 = 1 << 2,
-		Free03 = 1 << 3,
-		Free04 = 1 << 4,
-		Free05 = 1 << 5,
-		Free06 = 1 << 6,
-		Free07 = 1 << 7,
-		Free08 = 1 << 8,
-		Free09 = 1 << 9,
-		Free10 = 1 << 10,
-		Free11 = 1 << 11,
-		Free12 = 1 << 12,
-		Free13 = 1 << 13,
-		Free14 = 1 << 14,
-		Free15 = 1 << 15,
-	};
-
-	enum remix_custom_rs
-	{
-		RS_42_TEXTURE_CATEGORY = 42,
-		RS_149_REMIX_MODIFIER = 149,
-		RS_150_TEXTURE_HASH = 150,
-		RS_169_EMISSIVE_SCALE = 169,
-		RS_177_INFECTED_SHEET_UV = 177, // uint16 + uint16
-		RS_196_INFECTED_SKIN_GRAD = 196, // uint32 -> float
-		RS_197_INFECTED_GRAD_SELECT = 197, // uint16 + uint16
-		RS_210_PARAMS_PACKED = 210,
-		RS_211_INFECTED_NORMAL_ROUGH_BOOST = 211, // uint16 + uint16
-		RS_212_FREE = 212,
-		RS_213_FREE = 213,
-		RS_214_FREE = 214,
-		RS_215_FREE = 215,
-		RS_216_FREE = 216,
-		RS_217_FREE = 217,
-		RS_218_FREE = 218,
-		RS_219_FREE = 219,
-		RS_220_HASH_MODIFIER_SEED = 220,
-	};
-
-	enum remix_hash_seed
-	{
-		ZERO_EMISSION_SEED = 1337,
-	};
-
-	constexpr RemixModifier operator|(RemixModifier lhs, RemixModifier rhs) {
-		return static_cast<RemixModifier>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
-	}
-
-	constexpr RemixModifier& operator|=(RemixModifier& lhs, RemixModifier rhs) {
-		lhs = static_cast<RemixModifier>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
-		return lhs;
-	}
-
-	constexpr RemixModifier operator&(RemixModifier lhs, RemixModifier rhs) {
-		return static_cast<RemixModifier>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
-	}
-
-	constexpr RemixModifier& operator&=(RemixModifier& lhs, RemixModifier rhs) {
-		lhs = static_cast<RemixModifier>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
-		return lhs;
-	}
-
-	constexpr RemixModifier operator~(RemixModifier e) {
-		return static_cast<RemixModifier>(~static_cast<std::uint32_t>(e));
-	}
-
-	// can't use remixapi_InstanceCategoryFlags as they don't match up with InstanceCategories
-	enum class InstanceCategories : uint32_t
-	{
-		WorldUI = 1 << 0,
-		WorldMatte = 1 << 1,
-		Sky = 1 << 2,
-		Ignore = 1 << 3,
-		IgnoreLights = 1 << 4,
-		IgnoreAntiCulling = 1 << 5,
-		IgnoreMotionBlur = 1 << 6,
-		IgnoreOpacityMicromap = 1 << 7,
-		IgnoreAlphaChannel = 1 << 8,
-		Hidden = 1 << 9,
-		Particle = 1 << 10,
-		Beam = 1 << 11,
-		DecalStatic = 1 << 12,
-		DecalDynamic = 1 << 13,
-		DecalSingleOffset = 1 << 14,
-		DecalNoOffset = 1 << 15,
-		AlphaBlendToCutout = 1 << 16,
-		Terrain = 1 << 17,
-		AnimatedWater = 1 << 18,
-		ThirdPersonPlayerModel = 1 << 19,
-		ThirdPersonPlayerBody = 1 << 20,
-		IgnoreBakedLighting = 1 << 21,
-		IgnoreTransparencyLayer = 1 << 22,
-		ParticleEmitter = 1 << 23,
-		DisableBackfaceCulling = 1 << 24,
-		Count = 24,
-		None = 0u
-	};
-
-	constexpr InstanceCategories operator|(InstanceCategories lhs, InstanceCategories rhs) {
-		return static_cast<InstanceCategories>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
-	}
-
-	constexpr InstanceCategories& operator|=(InstanceCategories& lhs, InstanceCategories rhs) {
-		lhs = static_cast<InstanceCategories>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
-		return lhs;
-	}
-
-	constexpr InstanceCategories operator&(InstanceCategories lhs, InstanceCategories rhs) {
-		return static_cast<InstanceCategories>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
-	}
-
-	constexpr InstanceCategories& operator&=(InstanceCategories& lhs, InstanceCategories rhs) {
-		lhs = static_cast<InstanceCategories>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
-		return lhs;
-	}
-
-	constexpr InstanceCategories operator~(InstanceCategories e) {
-		return static_cast<InstanceCategories>(~static_cast<std::uint32_t>(e));
-	}
-
 	class prim_fvf_context
 	{
 	public:
@@ -171,90 +47,138 @@ namespace components
 			return false;
 		}
 
-		// set texture 0 transform
+		// Set texture 0 transform while preserving the exact game state once.
 		void set_texture_transform(IDirect3DDevice9* device, const D3DXMATRIX* matrix)
 		{
-			if (matrix)
+			if (!matrix) {
+				return;
+			}
+
+			if (!tex0_transform_set)
 			{
-				device->SetTransform(D3DTS_TEXTURE0, matrix);
+				if (FAILED(device->GetTransform(D3DTS_TEXTURE0, &tex0_transform_))) {
+					return;
+				}
 				tex0_transform_set = true;
 			}
+
+			device->SetTransform(D3DTS_TEXTURE0, matrix);
 		}
 
-		// save vertex shader
+		// Save the original programmable shaders only once per primitive context.
+		// World FFP conversion must restore both stages because leaving a Source
+		// pixel shader active makes DXVK treat the pass as programmable material input.
 		void save_vs(IDirect3DDevice9* device)
 		{
-			device->GetVertexShader(&vs_);
-			vs_set = true;
+			if (vs_set) {
+				return;
+			}
+
+			if (SUCCEEDED(device->GetVertexShader(&vs_))) {
+				vs_set = true;
+			}
 		}
 
-		// save texture at stage 0 or 1
-		void save_texture(IDirect3DDevice9* device, const bool stage)
+		void save_ps(IDirect3DDevice9* device)
 		{
-			if (!stage)
-			{
-#if DEBUG
-				if (tex0_set) {
-					OutputDebugStringA("save_texture:: tex0 was already saved\n"); return;
-				}
-#endif
-
-				device->GetTexture(0, &tex0_);
-				tex0_set = true;
+			if (ps_set) {
+				return;
 			}
-			else
+
+			if (SUCCEEDED(device->GetPixelShader(&ps_))) {
+				ps_set = true;
+			}
+		}
+
+		// Save a texture binding used by the compatibility renderer. GetTexture
+		// returns an owned COM reference; restore_texture releases that reference
+		// after rebinding it to the device.
+		void save_texture(IDirect3DDevice9* device, const std::uint32_t stage)
+		{
+			IDirect3DBaseTexture9** texture = nullptr;
+			bool* saved = nullptr;
+
+			switch (stage)
+			{
+			case 0u: texture = &tex0_; saved = &tex0_set; break;
+			case 1u: texture = &tex1_; saved = &tex1_set; break;
+			case 2u: texture = &tex2_; saved = &tex2_set; break;
+			case 3u: texture = &tex3_; saved = &tex3_set; break;
+			default:
+#if DEBUG
+				OutputDebugStringA("save_texture:: unsupported texture stage\n");
+#endif
+				return;
+			}
+
+			if (*saved)
 			{
 #if DEBUG
-				if (tex1_set) {
-					OutputDebugStringA("save_texture:: tex1 was already saved\n"); return;
-				}
+				OutputDebugStringA("save_texture:: texture stage was already saved\n");
 #endif
+				return;
+			}
 
-				device->GetTexture(1, &tex1_);
-				tex1_set = true;
+			if (SUCCEEDED(device->GetTexture(stage, texture))) {
+				*saved = true;
 			}
 		}
 
 		// save render state (e.g. D3DRS_TEXTUREFACTOR)
-		bool save_rs(IDirect3DDevice9* device, const D3DRENDERSTATETYPE& state)
+		void save_rs(IDirect3DDevice9* device, const D3DRENDERSTATETYPE& state)
 		{
 			if (saved_render_state_.contains(state)) {
-				return false;
+				return;
 			}
 
 			DWORD temp;
 			device->GetRenderState(state, &temp);
 			saved_render_state_[state] = temp;
-			return true;
 		}
 
-		bool save_rs(IDirect3DDevice9* device, const uint32_t& state)
+		static std::uint64_t make_stage_state_key(const std::uint32_t stage, const std::uint32_t state)
 		{
-			return save_rs(device, (D3DRENDERSTATETYPE)state);
+			return (static_cast<std::uint64_t>(stage) << 32u) | static_cast<std::uint64_t>(state);
 		}
 
-		// save sampler state (D3DSAMPLERSTATETYPE)
+		// Save sampler state for any sampler. The original helper only tracked
+		// sampler 0, which was insufficient once world FFP explicitly disabled
+		// stale stages used by the Source pixel shader.
+		void save_ss(IDirect3DDevice9* device, const std::uint32_t sampler, const D3DSAMPLERSTATETYPE& state)
+		{
+			const auto key = make_stage_state_key(sampler, static_cast<std::uint32_t>(state));
+			if (saved_sampler_state_.contains(key)) {
+				return;
+			}
+
+			DWORD temp = 0u;
+			if (SUCCEEDED(device->GetSamplerState(sampler, state, &temp))) {
+				saved_sampler_state_[key] = temp;
+			}
+		}
+
 		void save_ss(IDirect3DDevice9* device, const D3DSAMPLERSTATETYPE& state)
 		{
-			if (saved_sampler_state_.contains(state)) {
-				return;
-			}
-
-			DWORD temp;
-			device->GetSamplerState(0, state, &temp);
-			saved_sampler_state_[state] = temp;
+			save_ss(device, 0u, state);
 		}
 
-		// save texture stage 0 state (e.g. D3DTSS_ALPHAARG1)
-		void save_tss(IDirect3DDevice9* device, const D3DTEXTURESTAGESTATETYPE& type)
+		// Save texture-stage state for any stage while retaining the old stage-0 overload.
+		void save_tss(IDirect3DDevice9* device, const std::uint32_t stage, const D3DTEXTURESTAGESTATETYPE& type)
 		{
-			if (saved_texture_stage_state_.contains(type)) {
+			const auto key = make_stage_state_key(stage, static_cast<std::uint32_t>(type));
+			if (saved_texture_stage_state_.contains(key)) {
 				return;
 			}
 
-			DWORD temp;
-			device->GetTextureStageState(0, type, &temp);
-			saved_texture_stage_state_[type] = temp;
+			DWORD temp = 0u;
+			if (SUCCEEDED(device->GetTextureStageState(stage, type, &temp))) {
+				saved_texture_stage_state_[key] = temp;
+			}
+		}
+
+		void save_tss(IDirect3DDevice9* device, const D3DTEXTURESTAGESTATETYPE& type)
+		{
+			save_tss(device, 0u, type);
 		}
 
 		// save D3DTS_WORLD
@@ -282,34 +206,65 @@ namespace components
 			projection_transform_set_ = true;
 		}
 
-		// restore vertex shader
+		//// save steamsource data
+		//void save_streamsource_data(IDirect3DVertexBuffer9* buffer, UINT offset, UINT stride)
+		//{
+		//	streamsource_ = buffer;
+		//	streamsource_offset_ = offset;
+		//	streamsource_stride_ = stride;
+		//}
+
+		// Restore programmable shaders and release the COM references returned by Get*Shader.
 		void restore_vs(IDirect3DDevice9* device)
 		{
 			if (vs_set)
 			{
 				device->SetVertexShader(vs_);
+				if (vs_) {
+					vs_->Release();
+					vs_ = nullptr;
+				}
 				vs_set = false;
 			}
 		}
 
-		// restore texture at stage 0 or 1
-		void restore_texture(IDirect3DDevice9* device, const bool stage)
+		void restore_ps(IDirect3DDevice9* device)
 		{
-			if (!stage)
+			if (ps_set)
 			{
-				if (tex0_set)
-				{
-					device->SetTexture(0, tex0_);
-					tex0_set = false;
+				device->SetPixelShader(ps_);
+				if (ps_) {
+					ps_->Release();
+					ps_ = nullptr;
 				}
+				ps_set = false;
 			}
-			else
+		}
+
+		// Restore a saved texture binding and release the reference returned by
+		// GetTexture. Stages 2 and 3 are required by the L4D2 infected detail/wound payload.
+		void restore_texture(IDirect3DDevice9* device, const std::uint32_t stage)
+		{
+			IDirect3DBaseTexture9** texture = nullptr;
+			bool* saved = nullptr;
+
+			switch (stage)
 			{
-				if (tex1_set)
-				{
-					device->SetTexture(1, tex1_);
-					tex1_set = false;
+			case 0u: texture = &tex0_; saved = &tex0_set; break;
+			case 1u: texture = &tex1_; saved = &tex1_set; break;
+			case 2u: texture = &tex2_; saved = &tex2_set; break;
+			case 3u: texture = &tex3_; saved = &tex3_set; break;
+			default: return;
+			}
+
+			if (*saved)
+			{
+				device->SetTexture(stage, *texture);
+				if (*texture) {
+					(*texture)->Release();
+					*texture = nullptr;
 				}
+				*saved = false;
 			}
 		}
 
@@ -321,27 +276,40 @@ namespace components
 			}
 		}
 
-		// restore a specific sampler state (D3DSAMPLERSTATETYPE)
+		void restore_sampler_state(IDirect3DDevice9* device, const std::uint32_t sampler, const D3DSAMPLERSTATETYPE& state)
+		{
+			const auto key = make_stage_state_key(sampler, static_cast<std::uint32_t>(state));
+			if (saved_sampler_state_.contains(key)) {
+				device->SetSamplerState(sampler, state, saved_sampler_state_[key]);
+			}
+		}
+
 		void restore_sampler_state(IDirect3DDevice9* device, const D3DSAMPLERSTATETYPE& state)
 		{
-			if (saved_sampler_state_.contains(state)) {
-				device->SetSamplerState(0, state, saved_sampler_state_[state]);
+			restore_sampler_state(device, 0u, state);
+		}
+
+		void restore_texture_stage_state(IDirect3DDevice9* device, const std::uint32_t stage, const D3DTEXTURESTAGESTATETYPE& type)
+		{
+			const auto key = make_stage_state_key(stage, static_cast<std::uint32_t>(type));
+			if (saved_texture_stage_state_.contains(key)) {
+				device->SetTextureStageState(stage, type, saved_texture_stage_state_[key]);
 			}
 		}
 
-		// restore a specific texture stage 0 state (e.g. D3DTSS_ALPHAARG1)
 		void restore_texture_stage_state(IDirect3DDevice9* device, const D3DTEXTURESTAGESTATETYPE& type)
 		{
-			if (saved_texture_stage_state_.contains(type)) {
-				device->SetTextureStageState(0, type, saved_texture_stage_state_[type]);
-			}
+			restore_texture_stage_state(device, 0u, type);
 		}
 
-		// restore texture 0 transform to identity
+		// Restore the exact texture 0 transform captured before the first override.
 		void restore_texture_transform(IDirect3DDevice9* device)
 		{
-			device->SetTransform(D3DTS_TEXTURE0, &game::IDENTITY);
-			tex0_transform_set = false;
+			if (tex0_transform_set)
+			{
+				device->SetTransform(D3DTS_TEXTURE0, &tex0_transform_);
+				tex0_transform_set = false;
+			}
 		}
 
 		// restore saved D3DTS_WORLD
@@ -377,9 +345,12 @@ namespace components
 		// restore all changes
 		void restore_all(IDirect3DDevice9* device)
 		{
+			restore_ps(device);
 			restore_vs(device);
 			restore_texture(device, 0);
 			restore_texture(device, 1);
+			restore_texture(device, 2);
+			restore_texture(device, 3);
 			restore_texture_transform(device);
 			restore_world_transform(device);
 			restore_view_transform(device);
@@ -390,20 +361,35 @@ namespace components
 			}
 
 			for (auto& ss : saved_sampler_state_) {
-				device->SetSamplerState(0, ss.first, ss.second);
+				const auto sampler = static_cast<std::uint32_t>(ss.first >> 32u);
+				const auto state = static_cast<D3DSAMPLERSTATETYPE>(static_cast<std::uint32_t>(ss.first));
+				device->SetSamplerState(sampler, state, ss.second);
 			}
 
 			for (auto& tss : saved_texture_stage_state_) {
-				device->SetTextureStageState(0, tss.first, tss.second);
+				const auto stage = static_cast<std::uint32_t>(tss.first >> 32u);
+				const auto type = static_cast<D3DTEXTURESTAGESTATETYPE>(static_cast<std::uint32_t>(tss.first));
+				device->SetTextureStageState(stage, type, tss.second);
 			}
 		}
 
 		// reset the stored context data
 		void reset_context()
 		{
-			vs_ = nullptr; vs_set = false;
-			tex0_ = nullptr; tex0_set = false;
-			tex1_ = nullptr; tex1_set = false;
+			// Normally restore_all() releases these references first. Keep reset
+			// leak-safe for early-out/error paths as well.
+			if (vs_) { vs_->Release(); vs_ = nullptr; }
+			if (ps_) { ps_->Release(); ps_ = nullptr; }
+			if (tex0_) { tex0_->Release(); tex0_ = nullptr; }
+			if (tex1_) { tex1_->Release(); tex1_ = nullptr; }
+			if (tex2_) { tex2_->Release(); tex2_ = nullptr; }
+			if (tex3_) { tex3_->Release(); tex3_ = nullptr; }
+			vs_set = false;
+			ps_set = false;
+			tex0_set = false;
+			tex1_set = false;
+			tex2_set = false;
+			tex3_set = false;
 			tex0_transform_set = false;
 			world_transform_set_ = false;
 			view_transform_set_ = false;
@@ -431,9 +417,6 @@ namespace components
 			IDirect3DBaseTexture9* dual_render_texture = nullptr;
 			float dual_render_texture_z_offset = 0.0f;
 
-			InstanceCategories remix_instance_categories = InstanceCategories::None;
-			RemixModifier remix_modifier = RemixModifier::None;
-
 			void reset()
 			{
 				do_not_render = false;
@@ -445,11 +428,9 @@ namespace components
 				as_temp_unused = false;
 				dual_render_with_basetexture2 = false;
 				dual_render_with_specified_texture = false;
+				dual_render_with_specified_texture_blend_add = false;
 				dual_render_texture = nullptr;
 				dual_render_texture_z_offset = 0.0f;
-
-				remix_instance_categories = InstanceCategories::None;
-				remix_modifier = RemixModifier::None;
 			}
 		};
 
@@ -482,12 +463,19 @@ namespace components
 	private:
 		// Render states to save
 		IDirect3DVertexShader9* vs_ = nullptr;
+		IDirect3DPixelShader9* ps_ = nullptr;
 		IDirect3DBaseTexture9* tex0_ = nullptr;
 		IDirect3DBaseTexture9* tex1_ = nullptr;
+		IDirect3DBaseTexture9* tex2_ = nullptr;
+		IDirect3DBaseTexture9* tex3_ = nullptr;
 		bool vs_set = false;
+		bool ps_set = false;
 		bool tex0_set = false;
 		bool tex1_set = false;
+		bool tex2_set = false;
+		bool tex3_set = false;
 		bool tex0_transform_set = false;
+		D3DMATRIX tex0_transform_ = {};
 		D3DMATRIX world_transform_ = {};
 		D3DMATRIX view_transform_ = {};
 		D3DMATRIX projection_transform_ = {};
@@ -499,11 +487,33 @@ namespace components
 		std::unordered_map<D3DRENDERSTATETYPE, DWORD> saved_render_state_;
 
 		// store saved render states (with the type as the key)
-		std::unordered_map<D3DSAMPLERSTATETYPE, DWORD> saved_sampler_state_;
+		std::unordered_map<std::uint64_t, DWORD> saved_sampler_state_;
 
-		// store saved texture stage states (with type as the key)
-		std::unordered_map<D3DTEXTURESTAGESTATETYPE, DWORD> saved_texture_stage_state_;
+		// store saved texture stage states (stage and type are packed into the key)
+		std::unordered_map<std::uint64_t, DWORD> saved_texture_stage_state_;
 	};
+
+
+	namespace xorxor_water
+	{
+		struct status_s
+		{
+			std::uint64_t water_shader_passes = 0u;
+			std::uint64_t converted_dual_draws = 0u;
+			std::uint64_t hidden_beneath_passes = 0u;
+			std::uint64_t unsupported_vertex_formats = 0u;
+			std::uint64_t missing_surface_textures = 0u;
+			std::uint64_t stable_hash_bypasses = 0u;
+			std::uint64_t static_cache_bypasses = 0u;
+			std::uint32_t last_vertex_format = 0u;
+			std::string last_material;
+			std::string last_shader;
+		};
+
+		status_s snapshot();
+		void note_static_cache_bypass();
+		void print_status();
+	}
 
 	namespace tex_addons
 	{
@@ -511,10 +521,9 @@ namespace components
 		extern LPDIRECT3DTEXTURE9 rain_drop;
 		extern LPDIRECT3DTEXTURE9 black;
 		extern LPDIRECT3DTEXTURE9 white;
-		extern LPDIRECT3DTEXTURE9 berry;
 	}
 
-	class model_render final : public loader::component_module
+	class model_render : public component
 	{
 	public:
 		model_render();
@@ -528,13 +537,6 @@ namespace components
 		static void on_present();
 
 		static void init_texture_addons(bool release = false);
-
-		static void set_remix_modifier(IDirect3DDevice9* dev, RemixModifier mod, bool remove_mod = false);
-		static void set_remix_emissive_intensity(IDirect3DDevice9* dev, float intensity);
-		static void set_remix_texture_categories(IDirect3DDevice9* dev, const InstanceCategories& cat, bool remove_category = false);
-		static void set_remix_texture_hash(IDirect3DDevice9* dev, const std::uint32_t& hash);
-		static void set_remix_texture_hash_modifier(IDirect3DDevice9* dev, const std::uint32_t& seed);
-
 		static inline prim_fvf_context primctx {};
 
 		bool m_drew_model = false;

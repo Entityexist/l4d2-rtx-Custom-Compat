@@ -1,0 +1,34 @@
+L4D1 COMPATIBILITY BOOTSTRAP R1 - VALIDATION REPORT
+Date: 2026-07-20
+Base: L4D2 Compat V21.14.10 full source
+
+PASS - Uploaded PE files opened and mapped as 32-bit images.
+PASS - left4dead.exe identified by SHA-1 098d07422acc07d560315fafebd021ea661121cd.
+PASS - L4D1 Source interface inventory extracted from submitted binaries.
+PASS - Existing L4D2 signature audit completed:
+       engine.dll      23 sites: 4 unique, 18 missing, 1 ambiguous
+       client.dll      23 sites: 4 unique, 17 missing, 2 ambiguous
+       shaderapidx9.dll 4 sites: 0 unique, 3 missing, 1 ambiguous
+PASS - Dedicated native_l4d1_bootstrap profile present.
+PASS - left4dead.exe detection and known launcher SHA-1 present.
+PASS - L4D1 branch does not call MH_EnableHook and does not register L4D2 gameplay/render components.
+PASS - L4D2 fixed-address initialization remains gated by uses_l4d2_runtime().
+PASS - Read-only L4D1 camera/model-info resolver uses unique-match and module-range checks.
+PASS - VGUI_Surface030 fallback added while retaining Surface031 for L4D2.
+PASS - PlayerInfoManager002 null dereference removed.
+PASS - L4D1_ROOT Premake routing added without removing L4D2_ROOT.
+PASS - tools/validate_l4d1_bootstrap.py.
+PASS - validation/validate_trace_ray_abi_remix_category_v21_14_10.py.
+PASS - Python audit/validation utilities compile with py_compile.
+PASS - Modified C++ files passed string/comment-aware delimiter structure checks.
+PASS - Generated binary-audit JSON assertions match the submitted modules.
+
+NOT RUN - Native Win32/x86 MSVC compilation. The current execution environment is Linux
+          and does not provide Visual Studio/MSBuild or the Windows SDK.
+NOT RUN - In-game L4D1 runtime test with RTX Remix.
+
+Release boundary:
+- This package is an isolated compatibility bootstrap, not full feature parity.
+- Source interfaces, Remix API callbacks, F5 status overlay and read-only diagnostics are enabled.
+- L4D2 renderer/gameplay hooks, naked stubs, fixed RVAs, Light Studio, markers and flashlight
+  replacement remain disabled in L4D1 until separate L4D1 ABI audits are completed.

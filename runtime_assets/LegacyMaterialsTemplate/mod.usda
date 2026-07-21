@@ -1,0 +1,14 @@
+#usda 1.0
+(
+    customLayerData = {
+        string lightspeed_game_name = "Left 4 Dead 2"
+        string lightspeed_layer_type = "replacement"
+        string lightspeed_mod_name = "LegacyMaterials"
+        string lightspeed_mod_notes = "V20.3 semantic PBR compiler with provenance, grading, quarantine and protected user overrides"
+        string lightspeed_mod_version = "20.3.0"
+    }
+    subLayers = [ @./Materials.usda@ ]
+    metersPerUnit = 1
+    timeCodesPerSecond = 24
+    upAxis = "Z"
+)

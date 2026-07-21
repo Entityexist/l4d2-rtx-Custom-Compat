@@ -1,8 +1,6 @@
 #pragma once
 #include <random>
 
-#include "game/structs.hpp"
-
 #define ARR_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
 namespace utils
@@ -123,50 +121,6 @@ namespace utils
 	bool shader_dump_ps(IDirect3DPixelShader9* ps, const std::string& file_path, const std::string& file_name);
 
 	uint32_t pack_2f_in_dword(float f1, float f2);
-
-	class version_t
-	{
-	public:
-		version_t()
-		{}
-
-		static version_t from_string(const std::string& str)
-		{
-			version_t v; char dot;
-			std::stringstream ss(str);
-
-			ss >> v.major >> dot >> v.minor >> dot >> v.patch;
-			return v;
-		}
-
-		auto tie() const {
-			return std::tie(major, minor, patch);
-		}
-
-		bool operator<(const version_t& other) const {
-			return tie() < other.tie();
-		}
-
-		bool operator>(const version_t& other) const {
-			return tie() > other.tie();
-		}
-
-		bool operator<=(const version_t& other) const {
-			return tie() <= other.tie();
-		}
-
-		bool operator>=(const version_t& other) const {
-			return tie() >= other.tie();
-		}
-
-		bool operator==(const version_t& other) const {
-			return tie() == other.tie();
-		}
-
-		int major = 0;
-		int minor = 0;
-		int patch = 0;
-	};
 
 	class benchmark
 	{

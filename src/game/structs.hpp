@@ -272,13 +272,11 @@ namespace components
 		VPlane& operator=(const VPlane& thePlane);
 		
 	public:
-		Vector		m_Normal;
-		vec_t		m_Dist;
+		Vector		m_Normal = {};
+		vec_t		m_Dist = 0.0f;
 	};
 
-	inline VPlane::VPlane()
-	{
-	}
+	inline VPlane::VPlane() = default;
 
 	inline VPlane::VPlane(const Vector& vNormal, vec_t dist)
 	{
@@ -682,9 +680,37 @@ namespace components
 		int unused[7];
 	};
 
+	struct mstudiotexture_t
+	{
+		int sznameindex;
+		int flags;
+		int used;
+		int unused1;
+		int material;
+		void* client_material;
+		int unused[10];
+
+		const char* pszName() const
+		{
+			return sznameindex != 0 ? reinterpret_cast<const char*>(this) + sznameindex : "";
+		}
+	};
+
 	struct studiohdr_t
 	{
 		mstudiobone_t* pBone(int i) const { return (mstudiobone_t*)(((const byte*)this) + boneindex) + i; }
+		mstudiotexture_t* pTexture(int i) const
+		{
+			if (i < 0 || i >= numtextures || textureindex <= 0) return nullptr;
+			return reinterpret_cast<mstudiotexture_t*>(reinterpret_cast<byte*>(const_cast<studiohdr_t*>(this)) + textureindex) + i;
+		}
+		const char* pCdtexture(int i) const
+		{
+			if (i < 0 || i >= numcdtextures || cdtextureindex <= 0) return "";
+			const auto offsets = reinterpret_cast<const int*>(reinterpret_cast<const byte*>(this) + cdtextureindex);
+			const int offset = offsets[i];
+			return offset > 0 && offset < length ? reinterpret_cast<const char*>(this) + offset : "";
+		}
 
 		int id;
 		int version;
@@ -866,9 +892,47 @@ namespace components
 		CUtlSymbol m_Name;
 	};
 
+	struct ITexture;
+	struct ITexture_vtbl
+	{
+		const char* (__thiscall* GetName)(ITexture*);
+		int(__thiscall* GetMappingWidth)(ITexture*);
+		int(__thiscall* GetMappingHeight)(ITexture*);
+		int(__thiscall* GetActualWidth)(ITexture*);
+		int(__thiscall* GetActualHeight)(ITexture*);
+		int(__thiscall* GetNumAnimationFrames)(ITexture*);
+		bool(__thiscall* IsTranslucent)(ITexture*);
+		bool(__thiscall* IsMipmapped)(ITexture*);
+		void(__thiscall* GetLowResColorSample)(ITexture*, float, float, float*);
+		void* (__thiscall* GetResourceData)(ITexture*, std::uint32_t, std::size_t*);
+		void(__thiscall* IncrementReferenceCount)(ITexture*);
+		void(__thiscall* DecrementReferenceCount)(ITexture*);
+		void(__thiscall* SetTextureRegenerator)(ITexture*, void*);
+		void(__thiscall* Download)(ITexture*, void*, int);
+		int(__thiscall* GetApproximateVidMemBytes)(ITexture*);
+		bool(__thiscall* IsError)(ITexture*);
+		bool(__thiscall* IsVolumeTexture)(ITexture*);
+		int(__thiscall* GetMappingDepth)(ITexture*);
+		int(__thiscall* GetActualDepth)(ITexture*);
+		ImageFormat(__thiscall* GetImageFormat)(ITexture*);
+		int(__thiscall* GetNormalDecodeMode)(ITexture*);
+		bool(__thiscall* IsRenderTarget)(ITexture*);
+		bool(__thiscall* IsCubeMap)(ITexture*);
+		bool(__thiscall* IsNormalMap)(ITexture*);
+		bool(__thiscall* IsProcedural)(ITexture*);
+		void(__thiscall* DeleteIfUnreferenced)(ITexture*);
+		void(__thiscall* SwapContents)(ITexture*, ITexture*);
+		unsigned int(__thiscall* GetFlags)(ITexture*);
+		void(__thiscall* ForceLODOverride)(ITexture*, int);
+		bool(__thiscall* SaveToFile)(ITexture*, const char*);
+		void(__thiscall* CopyToStagingTexture)(ITexture*, ITexture*);
+		void(__thiscall* SetErrorTexture)(ITexture*, bool);
+		bool(__thiscall* BDownload)(ITexture*, void*, int);
+	};
+
 	struct ITexture
 	{
-		void* vtbl;
+		ITexture_vtbl* vftable;
 	};
 
 	struct IMaterialVar_vtbl
@@ -3020,7 +3084,7 @@ namespace components
 		//m_fnChangeCallbacks;
 	};
 
-	/*struct CCvar_vtbl;
+	struct CCvar_vtbl;
 	struct CCvar
 	{
 		CCvar_vtbl* vftable;
@@ -3039,7 +3103,7 @@ namespace components
 		ConVar* (__thiscall* FindVar)(CCvar*, const char*);
 		const ConCommand* (__thiscall* FindCommand_const)(CCvar*, const char*);
 		ConCommand* (__thiscall* FindCommand)(CCvar*, const char*);
-	};*/
+	};
 
 	struct CUtlString
 	{

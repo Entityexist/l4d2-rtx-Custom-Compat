@@ -1,18 +1,8 @@
 #include "std_include.hpp"
 
-#include "components/modules/choreo_events.hpp"
-#include "components/modules/game_settings.hpp"
-#include "components/modules/imgui.hpp"
-#include "components/modules/interfaces.hpp"
-#include "components/modules/main_module.hpp"
-#include "components/modules/model_render.hpp"
-#include "components/modules/remix_api.hpp"
-#include "components/modules/remix_lights.hpp"
-#include "components/modules/remix_markers.hpp"
-#include "components/modules/sound_events.hpp"
-
 namespace l4d2
 {
+	bool address_resolution_ok = false;
 	// -------------------------------------------
 	// game variables
 
@@ -20,7 +10,7 @@ namespace l4d2
 	void* mdl_cache = nullptr;
 
 	// - engine
-	CRender* engine_renderer = nullptr;
+	components::CRender* engine_renderer = nullptr;
 	DWORD* hoststate_worldbrush_data_ptr = nullptr;
 	Vector* current_view_origin = nullptr;
 	Vector* current_view_forward = nullptr;
@@ -32,7 +22,7 @@ namespace l4d2
 	DWORD* material_system_ptr = nullptr;
 	DWORD* modelinfo_ptr = nullptr;
 	Vector* camera_forward_vector = nullptr;
-	view_id* viewid = nullptr;
+	components::view_id* viewid = nullptr;
 
 	// - shaderapidx9
 	DWORD* d3d_device_ptr = nullptr;
@@ -63,7 +53,6 @@ namespace l4d2
 	uint32_t hk_addr__scene_ent_on_start_event = 0u;
 	uint32_t hk_addr__scene_ent_on_finish_event = 0u;
 	uint32_t fn_addr__util_remove = 0u;
-	uint32_t nop_addr__unreachable_nav_msg_print = 0u;
 
 	// - engine
 	uint32_t hk_addr__on_map_load = 0u;
@@ -116,26 +105,33 @@ namespace l4d2
 
 
 #define PATTERN_OFFSET_SIMPLE(mod, var, pattern, byte_offset, static_addr) \
-		if (const auto offset = utils::mem::find_pattern(mod, ##pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
+		if (const auto offset = utils::mem::find_pattern(mod, pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
 			(var) = offset; found_pattern_count++; \
 		} total_pattern_count++;
 
 #define PATTERN_OFFSET_SIMPLE_CAST(mod, var, type, pattern, byte_offset, static_addr) \
-		if (const auto offset = utils::mem::find_pattern(mod, ##pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
+		if (const auto offset = utils::mem::find_pattern(mod, pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
 			(var) = (type)offset; found_pattern_count++; \
 		} total_pattern_count++;
 
 #define PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(mod, var, type, pattern, byte_offset, static_addr) \
-		if (const auto offset = utils::mem::find_pattern(mod, ##pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
+		if (const auto offset = utils::mem::find_pattern(mod, pattern, byte_offset, #var, use_pattern, static_addr); offset) { \
 			(var) = (type)*(DWORD*)offset; found_pattern_count++; \
 		} total_pattern_count++;
 
 	// init any adresses here
-	void init_game_addresses()
+	bool init_game_addresses()
 	{
-		const bool use_pattern = !utils::flags::has_flag("no_pattern");
-		if (use_pattern) {
-			utils::log("L4D2", "Getting offsets ...", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
+		const bool use_pattern = !components::flags::has_flag("no_pattern");
+		const bool verbose_patterns =
+#ifdef DEBUG
+			true;
+#else
+			components::flags::has_flag("validate_patterns");
+#endif
+		if (verbose_patterns) {
+			game::console();
+			std::cout << "[L4D2] Resolving current Steam build addresses with signatures..." << std::endl;
 		}
 
 		std::uint32_t total_pattern_count = 0u;
@@ -154,12 +150,12 @@ namespace l4d2
 		PATTERN_OFFSET_SIMPLE(SERVER_MOD, hk_addr__scene_ent_on_start_event, "8B 7D ? 8B F1 68 ? ? ? ? 8B CF 89 45", 0, 0x1C0765);
 		PATTERN_OFFSET_SIMPLE(SERVER_MOD, hk_addr__scene_ent_on_finish_event, "8B 86 ?? ?? ?? ?? 85 C0 75 ?? B8 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 53", 0, 0x1C7813);
 		PATTERN_OFFSET_SIMPLE(SERVER_MOD, fn_addr__util_remove, "55 8B EC 8B 45 ? 85 C0 74 ? 83 C0", 0, 0x2071E0);
-		PATTERN_OFFSET_SIMPLE(SERVER_MOD, nop_addr__unreachable_nav_msg_print, "FF 15 ? ? ? ? 8B 4E ? 83 C4 ? 57", 0, 0x3A6469);
+
 
 		// --------------------------
 		// - engine - variables
 		if (const auto offset = utils::mem::find_pattern(ENGINE_MOD, "8B 0D ? ? ? ? 8B 75 ? ? ? 8B 55", 2, "engine_renderer", use_pattern, 0xAA3B2); offset) {
-			engine_renderer = (CRender*)*(DWORD*)*(DWORD*)offset; found_pattern_count++;
+			engine_renderer = (components::CRender*)*(DWORD*)*(DWORD*)offset; found_pattern_count++;
 		} total_pattern_count++;
 
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(ENGINE_MOD, hoststate_worldbrush_data_ptr, DWORD*, "A1 ? ? ? ? 8B 50 ? 53 56", 1, 0x5DB53);
@@ -167,7 +163,7 @@ namespace l4d2
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(ENGINE_MOD, current_view_forward, Vector*, "68 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 ? 56", 1, 0xC3DE9);
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(ENGINE_MOD, visframecount, int*, "3B 15 ? ? ? ? 75 ? 83 F8", 2, 0xCD65A);
 
-		
+
 
 		// - engine - functions
 		PATTERN_OFFSET_SIMPLE_CAST(ENGINE_MOD, R_CullNode, R_CullNode_t, "55 8B EC 80 3D ? ? ? ? ? 8B 4D", 0, 0xFC490);
@@ -186,7 +182,15 @@ namespace l4d2
 		PATTERN_OFFSET_SIMPLE(ENGINE_MOD, nop_addr__cullnode_backface_check02, "75 ? 8B D1 C1 EA", 0, 0xCD8CB);
 		PATTERN_OFFSET_SIMPLE(ENGINE_MOD, nop_addr__drawleaf_backface_check, "0F 87 ? ? ? ? 8B DA", 0, 0xCD4E7);
 		PATTERN_OFFSET_SIMPLE(ENGINE_MOD, nop_addr__draw_opaque_bmodel_backface_check, "74 ? 0F BF 4B", 0, 0xD2250);
-		PATTERN_OFFSET_SIMPLE(ENGINE_MOD, hk_addr__start_sound, "53 56 33 C9", 0, 0x1C0B6);
+		// S_StartSound has a short common prologue. Select the valid match nearest the
+		// previous Steam RVA instead of blindly taking the first module-wide hit.
+		if (const auto offset = utils::mem::find_pattern_nearest(ENGINE_MOD, "53 56 33 C9 57", 0x1C0B6, 0,
+			"hk_addr__start_sound", use_pattern, 0x1C0B6); offset)
+		{
+			hk_addr__start_sound = offset;
+			found_pattern_count++;
+		}
+		total_pattern_count++;
 
 		if (const auto offset = utils::mem::find_pattern(ENGINE_MOD, "E8 ? ? ? ? 83 C4 ? 8B 0D ? ? ? ? ? ? 8B 40 ? 8D 95", 0, "fn_addr__debug_overlay_add_text", use_pattern, 0x1C004); offset) {
 			fn_addr__debug_overlay_add_text = utils::mem::resolve_relative_call_address(offset); found_pattern_count++;
@@ -206,7 +210,7 @@ namespace l4d2
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(CLIENT_MOD, material_system_ptr, DWORD*, "A1 ? ? ? ? 53 56 57 89 4D ? 89 45", 1, 0x11B76);
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(CLIENT_MOD, modelinfo_ptr, DWORD*, "8B 0D ? ? ? ? ? ? 50 8B 42 ? FF D0 85 C0 74 ? 8B 0D ? ? ? ? ? ? 50 8B 82", 2, 0x19236);
 		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(CLIENT_MOD, camera_forward_vector, Vector*, "8D 93 ? ? ? ? 89 4D", 2, 0x1BAB58);
-		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(CLIENT_MOD, viewid, view_id*, "89 15 ? ? ? ? 83 C4", 2, 0x1CCFCC);
+		PATTERN_OFFSET_DWORD_PTR_CAST_TYPE(CLIENT_MOD, viewid, components::view_id*, "89 15 ? ? ? ? 83 C4", 2, 0x1CCFCC);
 
 		// - client - functions
 		//
@@ -221,22 +225,22 @@ namespace l4d2
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__draw_player_thirdperson_mesh_check03, "8B CF FF D0 84 C0 75 ? 53", 0, 0x22339F);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, retn_addr__draw_player_thirdperson_mesh, "8B 45 ? 8B 4D ? 50 51 8B CE E8 ? ? ? ? 5F 5E 5D", 0, 0x22341F);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__impact_marks_pshadow, "B1 ? 84 4B", 0, 0xF894E);
-		
+
 		if (hk_addr__impact_marks_pshadow) {
 			retn_addr__impact_marks_pshadow_skip = utils::mem::resolve_relative_jump_address(l4d2::hk_addr__impact_marks_pshadow + 5u, 6u, 2u); found_pattern_count++;
 		} total_pattern_count++;
 
-		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__render_spritecard_new, "8B 8D ? ? ? ? ? ? 8B 40 ? 8D 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 FF D0 8B 8D", 0, 0x3C9F1F); PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__render_spritecard_new, "8B 8D ? ? ? ? ? ? 8B 40 ? 8D 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 FF D0 8B 8D", 0, 0x3C9F1F);
+		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__render_spritecard_new, "8B 8D ? ? ? ? ? ? 8B 40 ? 8D 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 8B 95 ? ? ? ? 52 FF D0 8B 8D", 0, 0x3C9F1F);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__rope_mgr_draw_render_cache, "8B 8D ? ? ? ? ? ? 8B 52 ? 8D 85 ? ? ? ? 50 8B 85 ? ? ? ? 50 8B 45 ? 50 FF D2 8B 8D ? ? ? ? 89 9D ? ? ? ? 89 9D ? ? ? ? 89 5D ? 89 5D ? C7 85 ? ? ? ? ? ? ? ? 89 9D", 0, 0x93A3D);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, hk_addr__glow_overlay_draw, "F3 0F 10 85 ? ? ? ? F3 0F 59 C0 F3 0F 11 85 ? ? ? ? F3 0F 10 85 ? ? ? ? F3 0F 10 8D ? ? ? ? F3 0F 59 C0 F3 0F 58 C8 F3 0F 10 85 ? ? ? ? F3 0F 59 C0 F3 0F 58 C8 F3 0F 10 05", 0, 0x1080C0);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, nop_addr__func_area_portal_window_draw_mdl, "75 ? 33 C0 5F 8B E5 5D C2 ? ? ? ? 8B 50", 0, 0x7690E);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, fn_addr__add_console_cmd, "55 8B EC 8B 45 ? 53 33 DB 56 8B F1 8B 4D ? 80 66", 0, 0x3D36F0);
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, fn_addr__get_bone_transform, "55 8B EC 56 8B F1 83 BE ? ? ? ? ? 57 75 ? 8B 46 ? 8B 50 ? 8D 4E ? FF D2 85 C0 74 ? 8B CE E8 ? ? ? ? 8B 86", 0, 0x331C0);
-		
+
 		if (const auto offset = utils::mem::find_pattern(CLIENT_MOD, "E8 ? ? ? ? 89 86 ? ? ? ? 85 C0 0F 88", 0, "fn_addr__lookup_bone", use_pattern, 0x8D902); offset) {
 			fn_addr__lookup_bone = utils::mem::resolve_relative_call_address(offset); found_pattern_count++;
 		} total_pattern_count++;
-		
+
 		PATTERN_OFFSET_SIMPLE(CLIENT_MOD, fn_addr__get_model_ptr, "56 8B F1 83 BE ? ? ? ? ? 75 ? 8B 46 ? 8B 50 ? 8D 4E ? FF D2 85 C0 74 ? 8B CE E8 ? ? ? ? 8B 86 ? ? ? ? 5E 85 C0 74 ? ? ? ? 75 ? 33 C0 C3", 0, 0x2140);
 
 
@@ -269,38 +273,24 @@ namespace l4d2
 
 #pragma endregion
 
-		if (use_pattern)
+		address_resolution_ok = (found_pattern_count == total_pattern_count);
+		if (address_resolution_ok)
 		{
-			if (found_pattern_count == total_pattern_count) {
-				utils::log("L4D2", std::format("Found all '{:d}' Patterns.", total_pattern_count), utils::LOG_TYPE::LOG_TYPE_GREEN, true);
-			}
-			else
-			{
-				utils::log("L4D2", std::format("Only found '{:d}' out of '{:d}' Patterns.", found_pattern_count, total_pattern_count), utils::LOG_TYPE::LOG_TYPE_ERROR, true);
-				utils::log("L4D2", ">> Please create an issue on GitHub and attach this console log and information about your game (version, platform etc.)", utils::LOG_TYPE::LOG_TYPE_STATUS, true);
+			if (verbose_patterns) {
+				std::cout << "[L4D2] Address recovery complete: " << found_pattern_count << "/" << total_pattern_count << " address sites resolved." << std::endl;
 			}
 		}
+		else
+		{
+			game::console();
+			std::cerr << "[L4D2][FATAL] Address recovery incomplete: " << found_pattern_count << "/" << total_pattern_count << std::endl;
+			std::cerr << "[L4D2][FATAL] Full binary-hook runtime will not be installed to avoid patching address 0." << std::endl;
+		}
+		return address_resolution_ok;
 	}
 
+#undef PATTERN_OFFSET_DWORD_PTR_CAST_TYPE
+#undef PATTERN_OFFSET_SIMPLE_CAST
 #undef PATTERN_OFFSET_SIMPLE
 
-	void main()
-	{
-		init_game_addresses();
-
-		loader::module_loader::register_module(std::make_unique<interfaces>());
-		loader::module_loader::register_module(std::make_unique<game_settings>());
-		loader::module_loader::register_module(std::make_unique<remix_api>());
-		loader::module_loader::register_module(std::make_unique<choreo_events>());
-		loader::module_loader::register_module(std::make_unique<sound_events>());
-		loader::module_loader::register_module(std::make_unique<main_module>());
-		loader::module_loader::register_module(std::make_unique<model_render>());
-		loader::module_loader::register_module(std::make_unique<imgui>());
-		loader::module_loader::register_module(std::make_unique<remix_vars>());
-		loader::module_loader::register_module(std::make_unique<remix_markers>());
-		loader::module_loader::register_module(std::make_unique<map_settings>());
-		loader::module_loader::register_module(std::make_unique<remix_lights>());
-
-		MH_EnableHook(MH_ALL_HOOKS);
-	}
 }

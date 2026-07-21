@@ -1,0 +1,10 @@
+#usda 1.0
+
+# Resolved materials excluded from automatic activation.
+# This layer is intentionally not referenced by Materials.usda.
+over "RootNode"
+{
+    over "Looks"
+    {
+    }
+}

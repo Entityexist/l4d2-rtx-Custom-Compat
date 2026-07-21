@@ -1,16 +1,25 @@
 #include "std_include.hpp"
-#include "remix_api.hpp"
-
-#include "game_settings.hpp"
-#include "main_module.hpp"
-#include "model_render.hpp"
 
 namespace components
 {
+	namespace
+	{
+		bool remix_gameplay_active()
+		{
+			const auto* intf = interfaces::get();
+			return intf && intf->m_engine && intf->m_engine->is_playing();
+		}
+	}
 	// called on device->BeginScene
 	void remix_api::begin_scene_callback()
 	{
+		if (!loader::is_runtime_ready()) return;
+		if (!remix_gameplay_active()) return;
+
 		const auto api = get();
+		if (!api || !api->m_initialized) {
+			return;
+		}
 		if (api->m_debug_line_amount)
 		{
 			for (auto l = 1u; l < api->m_debug_line_amount + 1; l++)
@@ -84,20 +93,35 @@ namespace components
 
 		for (const auto& [n, fl] : api->m_flashlights)
 		{
-			if (fl.handle) {
-				api->m_bridge.DrawLightInstance(fl.handle);
-			}
-
-			if (fl.handle_inner) {
-				api->m_bridge.DrawLightInstance(fl.handle_inner);
-			}
+			auto submit_layer = [api](const remixapi_LightHandle handle, std::uint64_t& submitted)
+			{
+				if (!handle) return;
+				if (api->m_bridge.DrawLightInstance(handle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+					++submitted;
+				}
+				else {
+					// Compatibility lifecycle recreates every handle in flashlight_frame().
+					// Never mutate or destroy the rig from BeginScene; the next render frame
+					// replaces it through the original proven path.
+					++api->m_flashlight_runtime_stats.draw_failures;
+				}
+			};
+			submit_layer(fl.handle, api->m_flashlight_runtime_stats.submitted_main);
+			submit_layer(fl.handle_inner, api->m_flashlight_runtime_stats.submitted_core);
+			submit_layer(fl.handle_hotspot, api->m_flashlight_runtime_stats.submitted_hotspot);
+			submit_layer(fl.handle_spill, api->m_flashlight_runtime_stats.submitted_spill);
 		}
 	}
 
 	// called on device->EndScene
 	void remix_api::end_scene_callback()
 	{
-		//imgui::endscene_stub();
+		if (!loader::is_runtime_ready()) return;
+		if (!remix_gameplay_active()) return;
+
+		// Gameplay UI stays inside the original Xorxor/Remix EndScene callback.
+		// The direct Present hook is reserved for the Source front-end only.
+		imgui::endscene_stub(false);
 
 #if 0
 		if (!model_render::get()->m_drew_hud)
@@ -165,8 +189,29 @@ namespace components
 	// called on device->Present
 	void remix_api::on_present_callback()
 	{
-		main_module::hud_draw_area_info();
-		model_render::on_present();
+		if (!loader::is_runtime_ready()) return;
+		if (!remix_gameplay_active()) return;
+
+		// Generic Source mode owns no L4D2 main_module/model_render instances.
+		// Guard this callback so the Remix bridge can remain active without touching
+		// version-specific state.
+		if (!source_compat::uses_l4d2_runtime()) {
+			return;
+		}
+
+		if (main_module::get()) {
+			main_module::hud_draw_area_info();
+		}
+
+		// Draw marker fallback from Present only when DrawModelExecute did not submit
+		// the marker pass. This avoids duplicate geometry while still covering maps
+		// whose updated render path reaches Present without a normal model draw.
+		if (remix_markers::get() && (!model_render::get() || !model_render::get()->m_drew_model)) {
+			remix_markers::draw_nocull_markers(true);
+		}
+		if (model_render::get()) {
+			model_render::on_present();
+		}
 	}
 
 	// #
@@ -594,6 +639,17 @@ namespace components
 
 	void remix_api::flashlight_create_or_update(const char* player_name, const Vector& pos, const Vector& fwd, const Vector& rt, const Vector& up, bool is_enabled, bool is_player)
 	{
+		// The entity layout and flashlight offsets below are native-L4D2 data. Never
+		// manufacture ASI flashlight handles in HL2/Portal, even when the double-unsafe
+		// runtime override is being tested.
+		if (!source_compat::is_native_l4d2()) {
+			return;
+		}
+
+		if (!remix_api::is_initialized() || !player_name || !*player_name) {
+			return;
+		}
+
 		if (const auto it = m_flashlights.find(player_name);
 			it == m_flashlights.end())
 		{
@@ -601,6 +657,7 @@ namespace components
 			m_flashlights[player_name] =
 			{
 				.def = {.pos = pos, .fwd = fwd, .rt = rt, .up = up },
+				.last_seen_frame = main_module::framecount,
 				.is_player = is_player,
 				.is_enabled = is_enabled,
 				.is_alive = true
@@ -615,100 +672,282 @@ namespace components
 			it->second.def.up = up;
 			it->second.is_player = is_player;
 			it->second.is_enabled = is_enabled;
+			it->second.last_seen_frame = main_module::framecount;
+			it->second.missed_owner_frames = 0u;
 			it->second.is_alive = true;
 		}
 	}
 
-	void remix_api::flashlight_frame()
+	remix_api::flashlight_runtime_stats_s remix_api::flashlight_runtime_stats()
 	{
-		if (const auto api = remix_api::get();
-			remix_api::is_initialized())
-		{
-			for (auto& [name, fl] : api->m_flashlights)
-			{
-				// reset on each frame
-				// main_module::iterate_entities() checks if light is still alive
-				fl.is_alive = false;
+		const auto* api = remix_api::get();
+		return api ? api->m_flashlight_runtime_stats : flashlight_runtime_stats_s{};
+	}
 
-				if (fl.handle)
-				{
-					api->m_bridge.DestroyLight(fl.handle);
-					fl.handle = nullptr;
-				}
-
-				if (fl.handle_inner)
-				{
-					api->m_bridge.DestroyLight(fl.handle_inner);
-					fl.handle_inner = nullptr;
-				}
-
-				if (fl.is_enabled)
-				{
-					const auto gs = game_settings::get();
-
-					auto& info = fl.info;
-					auto& ext = fl.ext;
-
-					Vector lpos = fl.def.pos;
-					const Vector offs = fl.is_player ? gs->flashlight_offset_player.get_as<float*>() : gs->flashlight_offset_bot.get_as<float*>();
-					lpos += (fl.def.fwd * offs.x) + (fl.def.rt * offs.z) + (fl.def.up * offs.y);
-
-					ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-					ext.pNext = nullptr;
-					ext.position = lpos.ToRemixFloat3D(); 
-					ext.radius = gs->flashlight_radius.get_as<float>();
-					ext.volumetricRadianceScale = gs->flashlight_volumetric_scale.get_as<float>();
-					ext.shaping_hasvalue = TRUE;
-					ext.shaping_value = {};
-					ext.shaping_value.direction = fl.def.fwd.ToRemixFloat3D();
-					ext.shaping_value.coneAngleDegrees = gs->flashlight_angle.get_as<float>();
-					ext.shaping_value.coneSoftness = gs->flashlight_softness.get_as<float>();
-					ext.shaping_value.focusExponent = gs->flashlight_expo.get_as<float>();
-
-					info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-					info.pNext = &fl.ext;
-					info.hash = utils::string_hash64(utils::va("fl%s", name.c_str()));
-
-					const float intensity = gs->flashlight_intensity.get_as<float>();
-					info.radiance = remixapi_Float3D{ 20.0f * intensity, 20.0f * intensity, 20.0f * intensity };
-
-					api->m_bridge.CreateLight(&fl.info, &fl.handle);
-
-					// inner
-
-					auto& info_inner = fl.info_inner;
-					auto& ext_inner = fl.ext_inner;
-
-					ext_inner.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-					ext_inner.pNext = nullptr;
-					ext_inner.position = lpos.ToRemixFloat3D();
-					ext_inner.radius = gs->flashlight_inner_radius.get_as<float>();
-					ext_inner.volumetricRadianceScale = gs->flashlight_inner_volumetric_scale.get_as<float>();
-					ext_inner.shaping_hasvalue = TRUE;
-					ext_inner.shaping_value = {};
-					ext_inner.shaping_value.direction = fl.def.fwd.ToRemixFloat3D();
-					ext_inner.shaping_value.coneAngleDegrees = gs->flashlight_inner_angle.get_as<float>();
-					ext_inner.shaping_value.coneSoftness = gs->flashlight_inner_softness.get_as<float>();
-					ext_inner.shaping_value.focusExponent = gs->flashlight_inner_expo.get_as<float>();
-
-					info_inner.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-					info_inner.pNext = &fl.ext_inner;
-					info_inner.hash = utils::string_hash64(utils::va("flin%s", name.c_str()));
-
-					const float intensity_inner = gs->flashlight_inner_intensity.get_as<float>();
-					info_inner.radiance = remixapi_Float3D{ 20.0f * intensity_inner, 20.0f * intensity_inner, 20.0f * intensity_inner };
-
-					api->m_bridge.CreateLight(&fl.info_inner, &fl.handle_inner);
-				}
-			}
+	void remix_api::reset_flashlight_runtime_stats()
+	{
+		if (auto* api = remix_api::get()) {
+			api->m_flashlight_runtime_stats = {};
 		}
 	}
+
+	void remix_api::clear_flashlights()
+	{
+		auto* api = remix_api::get();
+		if (!api) return;
+		auto& stats = api->m_flashlight_runtime_stats;
+		for (auto& [name, fl] : api->m_flashlights)
+		{
+			for (auto* handle : { &fl.handle, &fl.handle_inner, &fl.handle_hotspot, &fl.handle_spill })
+			{
+				if (!*handle) continue;
+				if (api->m_initialized) api->m_bridge.DestroyLight(*handle);
+				*handle = nullptr;
+				++stats.destroyed_handles;
+			}
+		}
+		api->m_flashlights.clear();
+		stats.tracked_owners = 0u;
+		stats.active_handles = 0u;
+		stats.requested_layers = 0u;
+		stats.granted_layers = 0u;
+	}
+
+	void remix_api::flashlight_frame()
+	{
+		if (!source_compat::is_native_l4d2()) {
+			return;
+		}
+
+		auto* api = remix_api::get();
+		if (!api || !remix_api::is_initialized()) {
+			return;
+		}
+
+		auto* gs = game_settings::get();
+		if (!gs) {
+			return;
+		}
+
+		auto& stats = api->m_flashlight_runtime_stats;
+		stats.requested_layers = 0u;
+		stats.granted_layers = 0u;
+		stats.active_handles = 0u;
+		stats.tracked_owners = static_cast<std::uint32_t>(api->m_flashlights.size());
+
+		constexpr std::uint8_t k_layer_main = 1u << 0u;
+		constexpr std::uint8_t k_layer_core = 1u << 1u;
+		constexpr std::uint8_t k_layer_hotspot = 1u << 2u;
+		constexpr std::uint8_t k_layer_spill = 1u << 3u;
+
+		auto destroy_handle = [api, &stats](remixapi_LightHandle& handle)
+		{
+			if (!handle) return;
+			api->m_bridge.DestroyLight(handle);
+			handle = nullptr;
+			++stats.destroyed_handles;
+		};
+
+		auto layer_position = [](const flashlight_s& fl, const float* offset)
+		{
+			Vector position = fl.def.pos;
+			if (offset) {
+				position += (fl.def.fwd * offset[0]) + (fl.def.rt * offset[2]) + (fl.def.up * offset[1]);
+			}
+			return position;
+		};
+
+		auto layer_direction = [](const flashlight_s& fl, const float* offset)
+		{
+			Vector direction = fl.def.fwd;
+			if (offset)
+			{
+				const float pitch = DEG2RAD(std::clamp(offset[0], -45.0f, 45.0f));
+				const float yaw = DEG2RAD(std::clamp(offset[1], -45.0f, 45.0f));
+				direction = fl.def.fwd + fl.def.up * std::tan(pitch) + fl.def.rt * std::tan(yaw);
+			}
+			direction.NormalizeChecked();
+			return direction;
+		};
+
+		auto create_layer = [api, &stats](
+			remixapi_LightHandle& handle,
+			remixapi_LightInfoSphereEXT& ext,
+			remixapi_LightInfo& info,
+			const char* hash_prefix,
+			const std::string& owner_name,
+			const Vector& position,
+			const Vector& color,
+			const Vector& direction,
+			const float intensity,
+			const float radius,
+			const bool shaped,
+			const float angle,
+			const float softness,
+			const float exponent)
+		{
+			ext = {};
+			ext.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			ext.pNext = nullptr;
+			ext.position = position.ToRemixFloat3D();
+			ext.radius = std::max(0.001f, radius);
+			ext.shaping_hasvalue = shaped ? TRUE : FALSE;
+			ext.shaping_value = {};
+			if (shaped)
+			{
+				ext.shaping_value.direction = direction.ToRemixFloat3D();
+				ext.shaping_value.coneAngleDegrees = std::clamp(angle, 0.1f, 179.0f);
+				ext.shaping_value.coneSoftness = std::clamp(softness, 0.0f, 1.0f);
+				ext.shaping_value.focusExponent = std::max(0.0f, exponent);
+			}
+
+			info = {};
+			info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+			info.pNext = &ext;
+			info.hash = utils::string_hash64(utils::va("%s%s", hash_prefix, owner_name.c_str()));
+			const float energy = 20.0f * std::max(0.0f, intensity);
+			info.radiance = remixapi_Float3D{
+				energy * std::max(0.0f, color.x),
+				energy * std::max(0.0f, color.y),
+				energy * std::max(0.0f, color.z)
+			};
+
+			++stats.create_attempts;
+			if (api->m_bridge.CreateLight(&info, &handle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+				return true;
+			}
+			handle = nullptr;
+			++stats.create_failures;
+			return false;
+		};
+
+		for (auto& [name, fl] : api->m_flashlights)
+		{
+			// Compatibility lifecycle restored from the original working implementation:
+			// Remix light descriptors are rebuilt every rendered Source frame so position,
+			// orientation and shaping always follow the flashlight owner exactly.
+			fl.is_alive = false;
+			destroy_handle(fl.handle);
+			destroy_handle(fl.handle_inner);
+			destroy_handle(fl.handle_hotspot);
+			destroy_handle(fl.handle_spill);
+			fl.active_layer_mask = 0u;
+			fl.desired_layer_mask = 0u;
+			fl.has_built_state = false;
+			fl.stale_rig_fallback = false;
+			fl.consecutive_build_failures = 0u;
+			fl.retry_after = {};
+
+			if (!fl.is_enabled || !gs->flashlight_enabled.get_as<bool>()) {
+				continue;
+			}
+
+			std::uint8_t requested_mask = 0u;
+			if (gs->flashlight_main_enabled.get_as<bool>()) requested_mask |= k_layer_main;
+			if (gs->flashlight_inner_enabled.get_as<bool>()) requested_mask |= k_layer_core;
+			if (gs->flashlight_hotspot_enabled.get_as<bool>()) requested_mask |= k_layer_hotspot;
+			if (gs->flashlight_spill_enabled.get_as<bool>()) requested_mask |= k_layer_spill;
+			fl.desired_layer_mask = requested_mask;
+			stats.requested_layers += static_cast<std::uint32_t>(
+				((requested_mask & k_layer_main) ? 1 : 0) +
+				((requested_mask & k_layer_core) ? 1 : 0) +
+				((requested_mask & k_layer_hotspot) ? 1 : 0) +
+				((requested_mask & k_layer_spill) ? 1 : 0));
+
+			if (requested_mask & k_layer_main)
+			{
+				const float* offset = fl.is_player ? gs->flashlight_offset_player.get_as<float*>() : gs->flashlight_offset_bot.get_as<float*>();
+				const float* color = gs->flashlight_main_color.get_as<float*>();
+				if (create_layer(fl.handle, fl.ext, fl.info, "fl", name,
+					layer_position(fl, offset), Vector(color[0], color[1], color[2]),
+					layer_direction(fl, gs->flashlight_main_direction_offset.get_as<float*>()),
+					gs->flashlight_intensity.get_as<float>(), gs->flashlight_radius.get_as<float>(), true,
+					gs->flashlight_angle.get_as<float>(), gs->flashlight_softness.get_as<float>(), gs->flashlight_expo.get_as<float>()))
+				{
+					fl.active_layer_mask |= k_layer_main;
+					++stats.granted_layers;
+				}
+			}
+
+			if (requested_mask & k_layer_core)
+			{
+				const float* offset = fl.is_player ? gs->flashlight_inner_offset_player.get_as<float*>() : gs->flashlight_inner_offset_bot.get_as<float*>();
+				const float* color = gs->flashlight_inner_color.get_as<float*>();
+				if (create_layer(fl.handle_inner, fl.ext_inner, fl.info_inner, "flcore", name,
+					layer_position(fl, offset), Vector(color[0], color[1], color[2]), fl.def.fwd,
+					gs->flashlight_inner_intensity.get_as<float>(), gs->flashlight_inner_radius.get_as<float>(), false,
+					180.0f, 0.0f, 0.0f))
+				{
+					fl.active_layer_mask |= k_layer_core;
+					++stats.granted_layers;
+				}
+			}
+
+			if (requested_mask & k_layer_hotspot)
+			{
+				const float* offset = fl.is_player ? gs->flashlight_hotspot_offset_player.get_as<float*>() : gs->flashlight_hotspot_offset_bot.get_as<float*>();
+				const float* color = gs->flashlight_hotspot_color.get_as<float*>();
+				if (create_layer(fl.handle_hotspot, fl.ext_hotspot, fl.info_hotspot, "flhotspot", name,
+					layer_position(fl, offset), Vector(color[0], color[1], color[2]),
+					layer_direction(fl, gs->flashlight_hotspot_direction_offset.get_as<float*>()),
+					gs->flashlight_hotspot_intensity.get_as<float>(), gs->flashlight_hotspot_radius.get_as<float>(), true,
+					gs->flashlight_hotspot_angle.get_as<float>(), gs->flashlight_hotspot_softness.get_as<float>(), gs->flashlight_hotspot_expo.get_as<float>()))
+				{
+					fl.active_layer_mask |= k_layer_hotspot;
+					++stats.granted_layers;
+				}
+			}
+
+			if (requested_mask & k_layer_spill)
+			{
+				const float* offset = fl.is_player ? gs->flashlight_spill_offset_player.get_as<float*>() : gs->flashlight_spill_offset_bot.get_as<float*>();
+				const float* color = gs->flashlight_spill_color.get_as<float*>();
+				if (create_layer(fl.handle_spill, fl.ext_spill, fl.info_spill, "flspill", name,
+					layer_position(fl, offset), Vector(color[0], color[1], color[2]),
+					layer_direction(fl, gs->flashlight_spill_direction_offset.get_as<float*>()),
+					gs->flashlight_spill_intensity.get_as<float>(), gs->flashlight_spill_radius.get_as<float>(), true,
+					gs->flashlight_spill_angle.get_as<float>(), gs->flashlight_spill_softness.get_as<float>(), gs->flashlight_spill_expo.get_as<float>()))
+				{
+					fl.active_layer_mask |= k_layer_spill;
+					++stats.granted_layers;
+				}
+			}
+
+			stats.active_handles += fl.handle ? 1u : 0u;
+			stats.active_handles += fl.handle_inner ? 1u : 0u;
+			stats.active_handles += fl.handle_hotspot ? 1u : 0u;
+			stats.active_handles += fl.handle_spill ? 1u : 0u;
+			++stats.frame_updates;
+		}
+	}
+
 
 	// called from main_module::on_renderview()
 	void remix_api::on_renderview()
 	{
+		if (!try_initialize(false)) {
+			return;
+		}
+
 		if (is_initialized()) 
 		{
+			// CViewRender::RenderView may be entered more than once for one Source
+			// frame (main view, skybox or auxiliary passes). Entity scanning,
+			// flashlight bridge transactions and debug-mesh retirement are frame
+			// services, not per-view services, so execute them only once.
+			if (const auto* intf = interfaces::get(); intf && intf->m_globals)
+			{
+				const int source_frame = intf->m_globals->framecount;
+				const float source_realtime = intf->m_globals->realtime;
+				if (m_last_source_render_frame == source_frame && m_last_source_realtime == source_realtime)
+				{
+					++m_duplicate_render_views_skipped;
+					return;
+				}
+				m_last_source_render_frame = source_frame;
+				m_last_source_realtime = source_realtime;
+			}
+
 			main_module::iterate_entities();
 			remix_api::flashlight_frame();
 
@@ -757,19 +996,49 @@ namespace components
 	// #
 	// #
 
+	bool remix_api::try_initialize(const bool allow_console_log)
+	{
+		if (m_initialized) {
+			return true;
+		}
+
+		m_bridge = {};
+		const auto status = remixapi::bridge_initRemixApi(&m_bridge);
+		m_last_init_status = status;
+
+		if (status == REMIXAPI_ERROR_CODE_SUCCESS)
+		{
+			m_initialized = true;
+			m_reported_init_failure = false;
+
+			const auto cb_status = remixapi::bridge_setRemixApiCallbacks(begin_scene_callback, end_scene_callback, on_present_callback);
+			if (cb_status != REMIXAPI_ERROR_CODE_SUCCESS)
+			{
+				game::console();
+				printf("[!][RemixApi] Remix API initialized, but callback registration failed - Code: %d\n", cb_status);
+			}
+
+			printf("[+][RemixApi] Initialized successfully.\n");
+			return true;
+		}
+
+		m_initialized = false;
+		m_bridge = {};
+
+		if (allow_console_log && !m_reported_init_failure)
+		{
+			m_reported_init_failure = true;
+			game::console();
+			printf("[!][RemixApi] Failed to initialize the remixApi - Code: %d (11 = NOT_INITIALIZED, will retry during RenderView)\n", status);
+		}
+
+		return false;
+	}
+
 	remix_api::remix_api()
 	{
 		p_this = this;
-
-		if (const auto status = remixapi::bridge_initRemixApi(&m_bridge); 
-			status == REMIXAPI_ERROR_CODE_SUCCESS)
-		{
-			m_initialized = true;
-			remixapi::bridge_setRemixApiCallbacks(begin_scene_callback, end_scene_callback, on_present_callback);
-			log("RemixApi", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
-		}
-		else {
-			log("RemixApi", std::format("Failed to initialize the remixApi - Code: {:d}", static_cast<int>(status)), utils::LOG_TYPE::LOG_TYPE_ERROR, true);
-		}
+		m_bridge = {};
+		try_initialize(true);
 	}
 }

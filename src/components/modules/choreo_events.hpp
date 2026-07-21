@@ -7,23 +7,30 @@ namespace components
 		extern bool scene_print;
 	}
 
-	class choreo_events final : public loader::component_module
+	class choreo_events : public component
 	{
 	public:
+		struct history_entry
+		{
+			bool is_start = true;
+			std::string name;
+			std::string actor;
+			std::string event;
+			std::string param1;
+			float time = 0.0f;
+		};
+
 		choreo_events();
 
 		static inline choreo_events* p_this = nullptr;
 		static choreo_events* get() { return p_this; }
 
-		static bool is_initialized()
-		{
-			if (const auto mod = get(); mod && mod->m_initialized) {
-				return true;
-			}
-			return false;
-		}
-
 		static void on_client_frame();
+		static const std::deque<history_entry>& get_history();
+		static void clear_history();
+
+		static void push_history(bool is_start, const std::string_view& name, const std::string_view& actor, const std::string_view& event, const std::string_view& param1);
+		static inline std::deque<history_entry> m_history = {};
 
 
 		// ---
@@ -67,14 +74,13 @@ namespace components
 		};
 
 		// resets all choreo events
-		static void reset_all() {
+		static void reset_all()
+		{
 			ev_sample.reset();
 		}
 
 		static inline event_single ev_sample = {};
-		static inline std::vector<event_single> events = {};
 
-	private:
-		bool m_initialized = false;
+		static inline std::vector<event_single> events = {};
 	};
 }

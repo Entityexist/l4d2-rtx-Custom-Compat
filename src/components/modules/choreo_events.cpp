@@ -1,8 +1,4 @@
 #include "std_include.hpp"
-#include "choreo_events.hpp"
-#include "map_settings.hpp"
-#include "remix_lights.hpp"
-#include "remix_markers.hpp"
 
 namespace components
 {
@@ -12,6 +8,32 @@ namespace components
 	namespace cmd
 	{
 		bool scene_print = false;
+	}
+
+	const std::deque<choreo_events::history_entry>& choreo_events::get_history()
+	{
+		return m_history;
+	}
+
+	void choreo_events::clear_history()
+	{
+		m_history.clear();
+	}
+
+	void choreo_events::push_history(bool is_start, const std::string_view& name, const std::string_view& actor, const std::string_view& event, const std::string_view& param1)
+	{
+		history_entry entry = {};
+		entry.is_start = is_start;
+		entry.name = std::string(name);
+		entry.actor = std::string(actor);
+		entry.event = std::string(event);
+		entry.param1 = std::string(param1);
+		entry.time = interfaces::get()->m_globals ? interfaces::get()->m_globals->curtime : 0.0f;
+
+		m_history.push_front(entry);
+		while (m_history.size() > 64u) {
+			m_history.pop_back();
+		}
 	}
 
 	// called from main_module::on_renderview()
@@ -65,17 +87,7 @@ namespace components
 						++t; continue;
 					}
 
-					bool can_add_transition = true;
-
-					// do not allow the same transition twice
-					for (const auto& ip : remix_vars::interpolate_stack)
-					{
-						if (ip.identifier == t->hash)
-						{
-							can_add_transition = false;
-							break;
-						}
-					}
+					const bool can_add_transition = !remix_vars::has_interpolation_identifier(t->hash);
 
 					if (can_add_transition)
 					{
@@ -105,6 +117,10 @@ namespace components
 	// 'CSceneEntity::StartEvent' :: triggered on event start
 	void scene_ent_on_start_event_hk([[maybe_unused]] const CChoreoEvent* ev)
 	{
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+
 		if (ev && ev->m_Name.string && ev->m_pScene)
 		{
 			if (std::string_view(ev->m_Name.string) != "NULL")
@@ -117,6 +133,8 @@ namespace components
 				std::string choreo_string = ev->m_pScene->m_szFileName;
 				utils::replace_all(choreo_string, "\\", "/");
 
+				choreo_events::push_history(true, choreo_string, actor_str ? actor_str : "", event_str ? event_str : "", param1_str ? param1_str : "");
+
 				if (cmd::scene_print)
 				{
 					game::print_ingame(
@@ -127,6 +145,7 @@ namespace components
 				}
 
 				remix_lights::on_event_start(choreo_string, actor_str, event_str, param1_str);
+				dynamic_lighting::on_choreo_start(choreo_string, actor_str, event_str, param1_str);
 
 				// handle remix config transitions added via mapsettings
 				handle_confvar_transition(choreo_string, actor_str, event_str, param1_str, true);
@@ -163,8 +182,14 @@ namespace components
 	// 'CSceneEntity::OnSceneFinished' :: triggered right after the audio stops - ignores postdelay
 	void scene_ent_on_finish_event_hk(/*CChoreoSceneNew* scene,*/ const char* scene_name)
 	{
+		if (!loader::is_runtime_ready()) {
+			return;
+		}
+
 		if (scene_name)
 		{
+			choreo_events::push_history(false, scene_name, "", "", "");
+
 			if (cmd::scene_print)
 			{
 				game::print_ingame(
@@ -219,6 +244,12 @@ namespace components
 		cmd::scene_print = !cmd::scene_print;
 	}
 
+	ConCommand xo_debug_scene_history_clear_cmd {};
+	void xo_debug_scene_history_clear_fn()
+	{
+		choreo_events::clear_history();
+	}
+
 	// #
 	// #
 
@@ -227,18 +258,16 @@ namespace components
 		p_this = this;
 
 		// CSceneEntity::StartEvent :: : can be used to detect the start of scene (vcd) entities
-		utils::hook(l4d2::hk_addr__scene_ent_on_start_event, scene_ent_on_start_event_stub).install()->quick();
-		HOOK_RETN_PLACE(scene_ent_on_start_event_retn, l4d2::hk_addr__scene_ent_on_start_event + 5u);
+		utils::hook(l4d2::hk_addr__scene_ent_on_start_event, scene_ent_on_start_event_stub).install()->quick(); // 2001
+		HOOK_RETN_PLACE(scene_ent_on_start_event_retn, l4d2::hk_addr__scene_ent_on_start_event + 5u); // 2001
 
 		// CSceneEntity::OnSceneFinished
-		utils::hook::nop(l4d2::hk_addr__scene_ent_on_finish_event, 6);
-		utils::hook(l4d2::hk_addr__scene_ent_on_finish_event, scene_ent_on_finish_event_stub).install()->quick();
-		HOOK_RETN_PLACE(scene_ent_on_finish_event_retn, l4d2::hk_addr__scene_ent_on_finish_event + 6u);
+		utils::hook::nop(l4d2::hk_addr__scene_ent_on_finish_event, 6); // 2001
+		utils::hook(l4d2::hk_addr__scene_ent_on_finish_event, scene_ent_on_finish_event_stub).install()->quick(); // 2001
+		HOOK_RETN_PLACE(scene_ent_on_finish_event_retn, l4d2::hk_addr__scene_ent_on_finish_event + 6u); // 2001
 
 		// ----
 		game::con_add_command(&xo_debug_scene_print_cmd, "xo_debug_scene_print", xo_debug_scene_print_fn, "Print choreography (vcd) infos (similar to scene_info cvar but only showing relevant data)");
-
-		m_initialized = true;
-		log("ChoreoEvents", "Module initialized.", utils::LOG_TYPE::LOG_TYPE_DEFAULT, false);
+		game::con_add_command(&xo_debug_scene_history_clear_cmd, "xo_debug_scene_history_clear", xo_debug_scene_history_clear_fn, "Clear the ImGui choreography event history");
 	}
 }

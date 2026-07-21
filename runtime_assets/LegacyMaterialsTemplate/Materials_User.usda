@@ -1,0 +1,9 @@
+#usda 1.0
+
+# Protected manual corrections. The exporter never overwrites this file.
+over "RootNode"
+{
+    over "Looks"
+    {
+    }
+}
